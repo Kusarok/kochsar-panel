@@ -1,0 +1,5 @@
+config xrayop 'main'
+	# Panel bind address. The panel has no authentication yet, so keep this on
+	# a trusted LAN -- never expose it to the WAN.
+	option listen '0.0.0.0:8088'
+	option enabled '1'

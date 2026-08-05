@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>xrayop</title>
+<style>
+  /* Self-contained by necessity: the CSP on this page forbids any external
+     fetch, so fonts are a system stack and there are no images. */
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel-2:#1c232d; --line:#262d38;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#2f81f7; --accent-dim:#1f6feb33;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149;
+    --radius:12px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:var(--bg); color:var(--fg); min-height:100vh;
+    font:15px/1.7 "Segoe UI","Tahoma",system-ui,-apple-system,sans-serif;
+    padding-bottom:env(safe-area-inset-bottom);
+  }
+  .ltr{direction:ltr; unicode-bidi:isolate; text-align:left}
+  .wrap{max-width:820px; margin:0 auto; padding:16px}
+
+  /* ---- header ---- */
+  header{
+    position:sticky; top:0; z-index:20; background:rgba(14,17,22,.92);
+    backdrop-filter:blur(8px); border-bottom:1px solid var(--line);
+  }
+  .bar{display:flex; align-items:center; gap:12px; padding:12px 16px; max-width:820px; margin:0 auto}
+  .brand{font-weight:700; font-size:18px; letter-spacing:.4px}
+  .brand span{color:var(--accent)}
+  .spacer{flex:1}
+  .pill{
+    display:inline-flex; align-items:center; gap:7px; font-size:13px;
+    padding:5px 11px; border-radius:999px; background:var(--panel-2);
+    border:1px solid var(--line); white-space:nowrap;
+  }
+  .dot{width:8px; height:8px; border-radius:50%; background:var(--muted); flex:none}
+  .dot.on{background:var(--ok); box-shadow:0 0 8px var(--ok)}
+  .dot.off{background:var(--bad)}
+
+  /* ---- generic controls ---- */
+  button{
+    font:inherit; color:var(--fg); background:var(--panel-2);
+    border:1px solid var(--line); border-radius:9px; padding:8px 14px;
+    cursor:pointer; transition:.15s; white-space:nowrap;
+  }
+  button:hover:not(:disabled){border-color:var(--accent); background:var(--accent-dim)}
+  button:disabled{opacity:.45; cursor:not-allowed}
+  button.primary{background:var(--accent); border-color:var(--accent); color:#fff; font-weight:600}
+  button.primary:hover:not(:disabled){filter:brightness(1.12); background:var(--accent)}
+  button.danger:hover:not(:disabled){border-color:var(--bad); background:#f8514922; color:var(--bad)}
+  button.icon{padding:6px 10px; font-size:13px}
+
+  input,select,textarea{
+    font:inherit; width:100%; color:var(--fg); background:var(--bg);
+    border:1px solid var(--line); border-radius:9px; padding:9px 12px;
+  }
+  input:focus,select:focus,textarea:focus{outline:none; border-color:var(--accent)}
+  textarea{min-height:110px; resize:vertical; font-family:ui-monospace,Consolas,monospace; font-size:13px}
+  label{display:block; font-size:13px; color:var(--muted); margin-bottom:6px}
+  .field{margin-bottom:14px}
+  .row{display:flex; gap:10px; flex-wrap:wrap}
+  .row>*{flex:1; min-width:130px}
+
+  /* ---- tabs ---- */
+  nav{display:flex; gap:6px; padding:0 16px 10px; max-width:820px; margin:0 auto; overflow-x:auto}
+  nav button{border:none; background:none; padding:8px 14px; border-radius:9px; color:var(--muted)}
+  nav button.sel{background:var(--panel-2); color:var(--fg); font-weight:600}
+
+  /* ---- cards ---- */
+  .card{background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:16px; margin-bottom:14px}
+  .card h2{font-size:15px; margin-bottom:12px; font-weight:600}
+  .toolbar{display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px}
+
+  /* ---- node list ---- */
+  .node{
+    display:flex; align-items:center; gap:12px; padding:11px 13px;
+    border:1px solid var(--line); border-radius:10px; margin-bottom:8px;
+    background:var(--panel); cursor:pointer; transition:.15s;
+  }
+  .node:hover{border-color:#3a4453}
+  .node.sel{border-color:var(--accent); background:var(--accent-dim)}
+  .node .info{flex:1; min-width:0}
+  .node .nm{font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .node .sub{font-size:12px; color:var(--muted); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+  .tag{
+    font-size:11px; padding:2px 7px; border-radius:5px;
+    background:var(--panel-2); color:var(--muted); border:1px solid var(--line);
+  }
+  .ms{font-variant-numeric:tabular-nums; font-size:13px; font-weight:600; min-width:62px; text-align:center; flex:none}
+  .ms.g{color:var(--ok)} .ms.y{color:var(--warn)} .ms.r{color:var(--bad)} .ms.n{color:var(--muted)}
+
+  /* ---- dns grid ---- */
+  .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(190px,1fr)); gap:10px}
+  .dns{
+    text-align:right; padding:13px; border:1px solid var(--line); border-radius:10px;
+    background:var(--panel); cursor:pointer; transition:.15s;
+  }
+  .dns:hover{border-color:#3a4453}
+  .dns.sel{border-color:var(--accent); background:var(--accent-dim)}
+  .dns b{display:block; font-size:14px; margin-bottom:3px}
+  .dns .ip{font-size:12px; color:var(--muted); font-family:ui-monospace,Consolas,monospace}
+  .dns .note{font-size:11px; color:var(--muted); margin-top:5px}
+
+  /* ---- misc ---- */
+  .empty{text-align:center; color:var(--muted); padding:32px 12px; font-size:14px}
+  .muted{color:var(--muted); font-size:13px}
+  pre.log{
+    background:#0a0d11; border:1px solid var(--line); border-radius:9px; padding:12px;
+    font:12px/1.6 ui-monospace,Consolas,monospace; max-height:300px; overflow:auto;
+    white-space:pre-wrap; word-break:break-all; direction:ltr; text-align:left;
+  }
+  .err{
+    background:#f8514918; border:1px solid #f8514955; color:#ffa198;
+    border-radius:9px; padding:10px 13px; font-size:13px; margin-bottom:12px;
+  }
+  #toast{
+    position:fixed; bottom:20px; left:50%; transform:translateX(-50%) translateY(80px);
+    background:var(--panel-2); border:1px solid var(--line); color:var(--fg);
+    padding:11px 20px; border-radius:10px; font-size:14px; z-index:100;
+    transition:transform .25s, opacity .25s; opacity:0; pointer-events:none;
+    max-width:92vw; box-shadow:0 8px 24px #0008;
+  }
+  #toast.show{transform:translateX(-50%) translateY(0); opacity:1}
+  #toast.bad{border-color:var(--bad); color:#ffa198}
+  #toast.good{border-color:var(--ok)}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="bar">
+    <div class="brand">xray<span>op</span></div>
+    <div class="spacer"></div>
+    <div class="pill"><i class="dot" id="dot"></i><span id="statusText">در حال بارگذاری…</span></div>
+    <button id="power" class="icon">—</button>
+  </div>
+  <nav>
+    <button data-tab="nodes" class="sel">سرورها</button>
+    <button data-tab="subs">اشتراک‌ها</button>
+    <button data-tab="dns">DNS</button>
+    <button data-tab="tproxy">پراکسی شفاف</button>
+    <button data-tab="settings">تنظیمات</button>
+  </nav>
+</header>
+
+<div class="wrap">
+  <div id="banner"></div>
+
+  <!-- ============ SERVERS ============ -->
+  <section id="tab-nodes">
+    <div class="toolbar">
+      <button id="btnTest" class="primary">تست همه</button>
+      <button id="btnFastest">سریع‌ترین</button>
+      <button id="btnAddNode">افزودن دستی</button>
+    </div>
+    <div id="addNodeBox" class="card" hidden>
+      <h2>افزودن سرور با لینک</h2>
+      <div class="field">
+        <label>لینک‌های <code>vless://</code> — هر خط یک سرور، یا متن base64</label>
+        <textarea id="nodeText" dir="ltr" placeholder="vless://uuid@host:443?security=reality&amp;pbk=...#name"></textarea>
+      </div>
+      <div class="row">
+        <button class="primary" id="btnSaveNode">افزودن</button>
+        <button id="btnCancelNode">انصراف</button>
+      </div>
+    </div>
+    <div id="nodeList"></div>
+  </section>
+
+  <!-- ============ SUBSCRIPTIONS ============ -->
+  <section id="tab-subs" hidden>
+    <div class="card">
+      <h2>افزودن اشتراک</h2>
+      <div class="field">
+        <label>نشانی اشتراک</label>
+        <input id="subUrl" dir="ltr" placeholder="https://example.com/sub/xxxx" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>نام دلخواه (اختیاری)</label>
+        <input id="subName" placeholder="اشتراک اصلی" autocomplete="off">
+      </div>
+      <button class="primary" id="btnAddSub">افزودن و دریافت</button>
+    </div>
+    <div class="toolbar"><button id="btnRefreshAll">به‌روزرسانی همه</button></div>
+    <div id="subList"></div>
+  </section>
+
+  <!-- ============ DNS ============ -->
+  <section id="tab-dns" hidden>
+    <div class="card">
+      <h2>انتخاب سریع DNS</h2>
+      <p class="muted" style="margin-bottom:14px">
+        این DNS برای ترافیکی است که از تونل عبور می‌کند. تا وقتی پراکسی شفاف اضافه نشده،
+        DNS دستگاه‌های شبکه را تغییر نمی‌دهد.
+      </p>
+      <div class="grid" id="dnsGrid"></div>
+    </div>
+    <div class="card">
+      <h2>DNS دلخواه</h2>
+      <div class="field">
+        <label>نشانی‌ها را با کاما جدا کنید</label>
+        <input id="dnsCustom" dir="ltr" placeholder="1.1.1.1, 8.8.8.8" autocomplete="off">
+      </div>
+      <button class="primary" id="btnDnsCustom">اعمال</button>
+    </div>
+  </section>
+
+  <!-- ============ TRANSPARENT PROXY ============ -->
+  <section id="tab-tproxy" hidden>
+    <div id="tproxyPending" class="card" hidden style="border-color:var(--warn)">
+      <h2 style="color:var(--warn)">در انتظار تأیید</h2>
+      <p style="margin-bottom:14px">
+        قواعد اعمال شد. <b>همین حالا</b> یک صفحهٔ اینترنتی باز کنید و مطمئن شوید کار می‌کند.
+        اگر تأیید نکنید، همه‌چیز خودکار به حالت قبل برمی‌گردد.
+      </p>
+      <div style="font-size:34px;font-weight:700;text-align:center;margin:14px 0" id="countdown">—</div>
+      <div class="row">
+        <button class="primary" id="btnTpConfirm">اینترنت کار می‌کند — تأیید</button>
+        <button class="danger" id="btnTpCancel">برگردان</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>پراکسی شفاف</h2>
+      <p class="muted" style="margin-bottom:14px">
+        ترافیک همهٔ دستگاه‌های شبکه خودکار از تونل رد می‌شود، بدون تنظیم دستی پراکسی روی هر دستگاه.
+      </p>
+      <div id="tproxyStatus" style="margin-bottom:16px"></div>
+      <div class="row">
+        <button class="primary" id="btnTpEnable">فعال‌سازی</button>
+        <button class="danger" id="btnTpDisable">غیرفعال‌سازی</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>پیش از فعال‌سازی بخوانید</h2>
+      <ul class="muted" style="padding-inline-start:20px;line-height:2">
+        <li>ترافیک خروجی <b>خود روتر</b> هنوز از تونل رد نمی‌شود — فقط دستگاه‌های شبکه.</li>
+        <li>IPv6 مستقیم می‌ماند و تونل نمی‌شود.</li>
+        <li>اگر Passwall2 روشن باشد، هر دو همزمان فایروال را دست‌کاری می‌کنند. اول خاموشش کنید.</li>
+        <li>پس از هر <code>fw4 reload</code> باید دوباره اعمال شود.</li>
+        <li>دسترسی به خود روتر (SSH، LuCI، همین پنل) هیچ‌وقت رهگیری نمی‌شود.</li>
+      </ul>
+    </div>
+  </section>
+
+  <!-- ============ SETTINGS ============ -->
+  <section id="tab-settings" hidden>
+    <div class="card">
+      <h2>پورت‌ها</h2>
+      <div class="row">
+        <div class="field"><label>SOCKS5</label><input id="socksPort" type="number" min="1" max="65535" dir="ltr"></div>
+        <div class="field"><label>HTTP</label><input id="httpPort" type="number" min="1" max="65535" dir="ltr"></div>
+      </div>
+      <div class="field">
+        <label>دسترسی</label>
+        <select id="allowLan">
+          <option value="true">کل شبکه محلی (0.0.0.0)</option>
+          <option value="false">فقط خود روتر (127.0.0.1)</option>
+        </select>
+      </div>
+      <div class="row">
+        <div class="field"><label>مسیر باینری Xray</label><input id="xrayBin" dir="ltr"></div>
+        <div class="field">
+          <label>سطح لاگ</label>
+          <select id="logLevel">
+            <option value="debug">debug</option><option value="info">info</option>
+            <option value="warning">warning</option><option value="error">error</option>
+            <option value="none">none</option>
+          </select>
+        </div>
+      </div>
+      <button class="primary" id="btnSaveSettings">ذخیره و اعمال</button>
+    </div>
+    <div class="card">
+      <h2>راهنمای اتصال</h2>
+      <p class="muted" id="howto"></p>
+    </div>
+    <div class="card">
+      <h2>لاگ Xray</h2>
+      <div class="toolbar"><button id="btnLog">تازه‌سازی لاگ</button></div>
+      <pre class="log" id="logBox">—</pre>
+    </div>
+  </section>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+const $  = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+
+let state = null;
+let busy = false;
+let poll = null;
+
+/* ---------- helpers ---------- */
+
+// Everything user-controlled goes through this. The panel renders remarks and
+// URLs that came from a remote subscription, so it must never build markup by
+// concatenating them.
+function text(el, value) { el.textContent = value == null ? "" : String(value); return el; }
+
+function el(tag, cls, value) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (value !== undefined) n.textContent = value;
+  return n;
+}
+
+function toast(msg, kind) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.className = "show " + (kind || "");
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { t.className = ""; }, 3600);
+}
+
+async function api(path, body) {
+  const opts = body === undefined
+    ? { method: "GET" }
+    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const res = await fetch(path, opts);
+  let data = {};
+  try { data = await res.json(); } catch (_) { /* non-JSON error page */ }
+  if (!res.ok) throw new Error(data.error || ("خطای سرور " + res.status));
+  return data;
+}
+
+// Serialises actions so a double tap cannot fire two restarts at once.
+async function run(fn, okMsg) {
+  if (busy) return;
+  busy = true;
+  $$("button").forEach(b => b.disabled = true);
+  try {
+    const r = await fn();
+    if (r && r.apply_error) toast("ذخیره شد ولی اجرا نشد: " + r.apply_error, "bad");
+    else if (okMsg) toast(okMsg, "good");
+    await refresh();
+  } catch (e) {
+    toast(e.message || String(e), "bad");
+  } finally {
+    busy = false;
+    $$("button").forEach(b => b.disabled = false);
+  }
+}
+
+function latencyCell(ms) {
+  const n = el("div", "ms");
+  if (ms === -1) { n.classList.add("n"); n.textContent = "—"; }
+  else if (ms === -2) { n.classList.add("r"); n.textContent = "قطع"; }
+  else {
+    n.classList.add(ms < 150 ? "g" : ms < 400 ? "y" : "r");
+    n.textContent = ms + " ms";
+  }
+  return n;
+}
+
+function ago(unix) {
+  if (!unix) return "هرگز";
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - unix);
+  if (s < 60) return "لحظاتی پیش";
+  if (s < 3600) return Math.floor(s / 60) + " دقیقه پیش";
+  if (s < 86400) return Math.floor(s / 3600) + " ساعت پیش";
+  return Math.floor(s / 86400) + " روز پیش";
+}
+
+/* ---------- rendering ---------- */
+
+function render() {
+  if (!state) return;
+  const st = state.status;
+
+  const dot = $("#dot");
+  dot.className = "dot " + (st.running ? "on" : "off");
+  const active = state.nodes.find(n => n.active);
+  text($("#statusText"), st.running ? (active ? active.name : "متصل")
+                                    : (state.active ? "متوقف" : "سروری انتخاب نشده"));
+  const power = $("#power");
+  text(power, st.running ? "قطع" : "اتصال");
+  power.className = "icon " + (st.running ? "danger" : "primary");
+
+  const banner = $("#banner");
+  banner.replaceChildren();
+  if (st.last_error) banner.appendChild(el("div", "err", st.last_error));
+
+  renderNodes();
+  renderSubs();
+  renderDns();
+  renderTproxy();
+  renderSettings();
+}
+
+function renderTproxy() {
+  const t = state.tproxy;
+  const pending = t.deadline > 0;
+
+  $("#tproxyPending").hidden = !pending;
+  $("#btnTpEnable").hidden = pending || t.enabled;
+  $("#btnTpDisable").hidden = pending || !t.enabled;
+
+  // The server clock is authoritative: the browser's may be minutes off, and
+  // this countdown is the user's only warning before an automatic rollback.
+  if (pending) startCountdown(t.deadline - t.now);
+  else stopCountdown();
+
+  const box = $("#tproxyStatus");
+  box.replaceChildren();
+
+  const line = (label, value, cls) => {
+    const d = el("div");
+    d.style.cssText = "display:flex;gap:10px;padding:5px 0";
+    const k = el("span", "muted", label);
+    k.style.minWidth = "150px";
+    d.appendChild(k);
+    d.appendChild(text(el("b", cls), value));
+    box.appendChild(d);
+  };
+
+  line("وضعیت", t.enabled ? "فعال" : "غیرفعال");
+  // These two disagreeing means the rules were wiped underneath us -- almost
+  // always a `fw4 reload`. Saying so beats showing a bare "no".
+  line("قواعد در کرنل", t.applied ? "اعمال شده" : "اعمال نشده");
+  if (t.enabled && !t.applied) {
+    box.appendChild(el("div", "err",
+      "تنظیم فعال است ولی قواعد در کرنل نیست — احتمالاً fw4 دوباره بارگذاری شده. یک بار غیرفعال و دوباره فعال کنید."));
+  }
+  line("پورت TPROXY", String(t.port));
+  line("رابط‌های شبکه", t.interfaces.join("، ") || "—");
+  line("IPv6", t.tunnel_ipv6 ? "از تونل" : "مستقیم");
+}
+
+let countdownTimer = null;
+function startCountdown(seconds) {
+  stopCountdown();
+  let left = Math.max(0, seconds);
+  const tick = () => {
+    const m = Math.floor(left / 60), s = left % 60;
+    text($("#countdown"), m + ":" + String(s).padStart(2, "0"));
+    if (left <= 0) { stopCountdown(); setTimeout(refresh, 1500); return; }
+    left--;
+  };
+  tick();
+  countdownTimer = setInterval(tick, 1000);
+}
+function stopCountdown() {
+  if (countdownTimer) { clearInterval(countdownTimer); countdownTimer = null; }
+}
+
+function renderNodes() {
+  const box = $("#nodeList");
+  box.replaceChildren();
+
+  if (!state.nodes.length) {
+    box.appendChild(el("div", "empty", "هنوز سروری اضافه نشده. از تب اشتراک‌ها یا «افزودن دستی» شروع کنید."));
+    return;
+  }
+
+  const subName = {};
+  state.subs.forEach(s => { subName[s.id] = s.name; });
+
+  // Reachable first, fastest first, untested last -- the order a user wants.
+  const sorted = state.nodes.slice().sort((a, b) => {
+    const rank = (v) => (v.latency >= 0 ? 0 : v.latency === -1 ? 1 : 2);
+    return rank(a) - rank(b) || (a.latency >= 0 ? a.latency - b.latency : 0);
+  });
+
+  for (const n of sorted) {
+    const row = el("div", "node" + (n.active ? " sel" : ""));
+
+    const info = el("div", "info");
+    info.appendChild(text(el("div", "nm"), n.name));
+    const sub = el("div", "sub ltr");
+    text(sub, n.server + ":" + n.port);
+    info.appendChild(sub);
+    row.appendChild(info);
+
+    const badge = el("span", "tag", n.security === "reality" ? "REALITY" : n.security.toUpperCase());
+    row.appendChild(badge);
+    if (n.sub_id && subName[n.sub_id]) row.appendChild(text(el("span", "tag"), subName[n.sub_id]));
+
+    row.appendChild(latencyCell(n.latency));
+
+    // Confirm first: this button sits inside a row that selects on tap, so a
+    // mistimed touch is otherwise an instant, silent server deletion.
+    const del = el("button", "icon danger", "حذف");
+    del.onclick = (ev) => {
+      ev.stopPropagation();
+      if (!confirm("سرور «" + n.name + "» حذف شود؟")) return;
+      run(() => api("/api/nodes/remove", { id: n.id }), "حذف شد");
+    };
+    row.appendChild(del);
+
+    row.onclick = () => {
+      if (n.active) return;
+      run(() => api("/api/select", { id: n.id }), "به «" + n.name + "» وصل شد");
+    };
+    box.appendChild(row);
+  }
+}
+
+function renderSubs() {
+  const box = $("#subList");
+  box.replaceChildren();
+
+  if (!state.subs.length) {
+    box.appendChild(el("div", "empty", "هیچ اشتراکی ثبت نشده."));
+    return;
+  }
+
+  for (const s of state.subs) {
+    const card = el("div", "card");
+    card.appendChild(text(el("h2"), s.name));
+
+    const url = el("div", "muted ltr");
+    text(url, s.url);
+    url.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:8px";
+    card.appendChild(url);
+
+    card.appendChild(text(el("div", "muted"),
+      s.node_count + " سرور · آخرین به‌روزرسانی: " + ago(s.last_update)));
+
+    if (s.last_error) card.appendChild(el("div", "err", s.last_error));
+
+    const bar = el("div", "toolbar");
+    bar.style.margin = "12px 0 0";
+    const up = el("button", "icon", "به‌روزرسانی");
+    up.onclick = () => run(() => api("/api/subs/refresh", { id: s.id }), "به‌روزرسانی شد");
+    const rm = el("button", "icon danger", "حذف");
+    rm.onclick = () => {
+      if (!confirm("این اشتراک و همه سرورهایش حذف شوند؟")) return;
+      run(() => api("/api/subs/remove", { id: s.id }), "حذف شد");
+    };
+    bar.append(up, rm);
+    card.appendChild(bar);
+    box.appendChild(card);
+  }
+}
+
+function renderDns() {
+  const grid = $("#dnsGrid");
+  grid.replaceChildren();
+  for (const p of state.dns_presets) {
+    const b = el("button", "dns" + (state.settings.dns_preset === p.key ? " sel" : ""));
+    b.appendChild(text(el("b"), p.label));
+    b.appendChild(text(el("div", "ip"), p.servers.join(" · ")));
+    b.appendChild(text(el("div", "note"), p.note));
+    b.onclick = () => run(() => api("/api/dns", { preset: p.key }), p.label + " اعمال شد");
+    grid.appendChild(b);
+  }
+  if (document.activeElement !== $("#dnsCustom")) {
+    $("#dnsCustom").value = state.settings.dns_custom || "";
+  }
+}
+
+function renderSettings() {
+  const s = state.settings;
+  const set = (sel, v) => { const n = $(sel); if (document.activeElement !== n) n.value = v; };
+  set("#socksPort", s.socks_port);
+  set("#httpPort", s.http_port);
+  set("#allowLan", String(s.allow_lan));
+  set("#xrayBin", s.xray_bin);
+  set("#logLevel", s.log_level);
+
+  const host = location.hostname;
+  text($("#howto"),
+    "پراکسی SOCKS5 روی " + host + ":" + s.socks_port +
+    " و HTTP روی " + host + ":" + s.http_port + " در دسترس است. " +
+    (s.allow_lan ? "همه دستگاه‌های شبکه می‌توانند وصل شوند."
+                 : "فقط از خود روتر قابل استفاده است."));
+}
+
+/* ---------- data ---------- */
+
+async function refresh() {
+  try {
+    state = await api("/api/state");
+    render();
+  } catch (e) {
+    $("#dot").className = "dot off";
+    text($("#statusText"), "ارتباط با سرویس قطع است");
+  }
+}
+
+/* ---------- wiring ---------- */
+
+$$("nav button").forEach(btn => {
+  btn.onclick = () => {
+    $$("nav button").forEach(b => b.classList.toggle("sel", b === btn));
+    ["nodes", "subs", "dns", "tproxy", "settings"].forEach(t => {
+      $("#tab-" + t).hidden = (t !== btn.dataset.tab);
+    });
+  };
+});
+
+$("#power").onclick = () => {
+  const running = state && state.status.running;
+  run(() => api("/api/service", { action: running ? "stop" : "start" }),
+      running ? "قطع شد" : "وصل شد");
+};
+
+$("#btnTest").onclick = () => run(async () => {
+  const r = await api("/api/test", {});
+  toast(r.reachable + " از " + r.tested + " سرور در دسترس است" +
+        (r.best ? " · سریع‌ترین: " + r.best.name + " (" + r.best.latency + "ms)" : ""), "good");
+  return r;
+});
+
+$("#btnFastest").onclick = () => run(() => api("/api/select", { id: "fastest" }), "به سریع‌ترین سرور وصل شد");
+
+$("#btnAddNode").onclick = () => { $("#addNodeBox").hidden = false; $("#nodeText").focus(); };
+$("#btnCancelNode").onclick = () => { $("#addNodeBox").hidden = true; $("#nodeText").value = ""; };
+$("#btnSaveNode").onclick = () => run(async () => {
+  const r = await api("/api/nodes/add", { text: $("#nodeText").value });
+  $("#addNodeBox").hidden = true;
+  $("#nodeText").value = "";
+  toast(r.imported + " سرور اضافه شد" + (r.skipped ? " · " + r.skipped + " پروتکل پشتیبانی‌نشده" : ""), "good");
+  return r;
+});
+
+$("#btnAddSub").onclick = () => run(async () => {
+  const r = await api("/api/subs/add", { url: $("#subUrl").value, name: $("#subName").value });
+  $("#subUrl").value = ""; $("#subName").value = "";
+  toast(r.imported + " سرور دریافت شد" + (r.skipped ? " · " + r.skipped + " پشتیبانی‌نشده" : ""), "good");
+  return r;
+});
+
+$("#btnRefreshAll").onclick = () => run(async () => {
+  const r = await api("/api/subs/refresh", {});
+  toast(r.imported + " سرور به‌روز شد" + (r.failed_subs ? " · " + r.failed_subs + " اشتراک ناموفق" : ""), "good");
+  return r;
+});
+
+$("#btnTpEnable").onclick = () => {
+  if (!confirm("قواعد فایروال روتر تغییر می‌کند.\n\nبعد از اعمال، ۹۰ ثانیه فرصت دارید تأیید کنید که اینترنت کار می‌کند. "
+             + "اگر تأیید نکنید، خودکار برمی‌گردد.\n\nادامه می‌دهید؟")) return;
+  run(async () => {
+    const r = await api("/api/tproxy/enable", {});
+    toast("اعمال شد — تا " + r.confirm_within + " ثانیه تأیید کنید", "good");
+    return r;
+  });
+};
+$("#btnTpConfirm").onclick = () => run(() => api("/api/tproxy/confirm", {}), "تأیید شد و ذخیره گردید");
+$("#btnTpCancel").onclick  = () => run(() => api("/api/tproxy/disable", {}), "به حالت قبل برگشت");
+$("#btnTpDisable").onclick = () => run(() => api("/api/tproxy/disable", {}), "غیرفعال شد");
+
+$("#btnDnsCustom").onclick = () =>
+  run(() => api("/api/dns", { preset: "custom", custom: $("#dnsCustom").value }), "DNS دلخواه اعمال شد");
+
+$("#btnSaveSettings").onclick = () => run(() => api("/api/settings", {
+  socks_port: Number($("#socksPort").value),
+  http_port:  Number($("#httpPort").value),
+  allow_lan:  $("#allowLan").value === "true",
+  xray_bin:   $("#xrayBin").value,
+  log_level:  $("#logLevel").value,
+}), "تنظیمات ذخیره شد");
+
+$("#btnLog").onclick = async () => {
+  try {
+    const r = await api("/api/log");
+    text($("#logBox"), r.log || "(خالی)");
+  } catch (e) { toast(e.message, "bad"); }
+};
+
+// Light polling keeps the status pill honest without hammering the router.
+// Skipped while an action is in flight so it cannot clobber a pending render.
+poll = setInterval(() => { if (!busy) refresh(); }, 6000);
+refresh();
+</script>
+</body>
+</html>

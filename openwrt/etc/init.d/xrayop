@@ -1,0 +1,46 @@
+#!/bin/sh /etc/rc.common
+# procd service for xrayopd.
+#
+# Starts after the network is up (START=95) and stops early (STOP=10) so the
+# proxy is torn down before interfaces go away.
+
+USE_PROCD=1
+START=95
+STOP=10
+
+PROG=/usr/bin/xrayopd
+STATE_DIR=/etc/xrayop
+RUNTIME_DIR=/var/etc/xrayop
+
+start_service() {
+	config_load xrayop
+
+	local enabled listen
+	config_get_bool enabled main enabled 1
+	config_get listen main listen "0.0.0.0:8088"
+
+	[ "$enabled" -eq 1 ] || return 0
+
+	# State persists across reboots; runtime lives on tmpfs to spare the flash.
+	mkdir -p "$STATE_DIR" "$RUNTIME_DIR"
+
+	procd_open_instance xrayop
+	procd_set_param command "$PROG" \
+		--listen "$listen" \
+		--state "$STATE_DIR/state.json" \
+		--runtime "$RUNTIME_DIR"
+	# Give up after 5 crashes in an hour rather than respawn-looping forever.
+	procd_set_param respawn 3600 5 5
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param pidfile /var/run/xrayopd.pid
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger "xrayop"
+}
+
+reload_service() {
+	restart
+}

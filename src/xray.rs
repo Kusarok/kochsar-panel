@@ -1,0 +1,750 @@
+//! Xray config generation and process supervision.
+
+use crate::dnscfg;
+use crate::model::{Node, State};
+use serde_json::{json, Map, Value};
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// How long to watch a freshly spawned Xray before calling the start a success.
+/// See [`Supervisor::wait_until_settled`].
+const SETTLE: Duration = Duration::from_millis(500);
+/// Poll interval within that window, so a failure is reported promptly.
+const POLL: Duration = Duration::from_millis(50);
+
+/// Addresses that must never be tunnelled, so LAN and loopback stay reachable
+/// through the proxy port. Written out literally instead of `geoip:private` so
+/// the daemon does not depend on geoip.dat being installed.
+const PRIVATE_NETS: &[&str] = &[
+    "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "169.254.0.0/16",
+    "224.0.0.0/4",
+    "::1/128",
+    "fc00::/7",
+    "fe80::/10",
+];
+
+/// Builds a complete Xray config for the selected node.
+///
+/// Returns `None` when no node is selected -- the caller should stop Xray
+/// rather than run it with an empty outbound list.
+pub fn build_config(state: &State) -> Option<Value> {
+    let node = state.find(&state.active)?;
+    let s = &state.settings;
+    let listen = if s.allow_lan { "0.0.0.0" } else { "127.0.0.1" };
+
+    let sniffing = json!({
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"],
+        // Keep the original domain so the remote server does the resolving.
+        // Without this, routing sees a pre-resolved IP and domain rules break.
+        "routeOnly": false
+    });
+
+    let mut inbounds = vec![
+        json!({
+            "tag": "socks-in",
+            "listen": listen,
+            "port": s.socks_port,
+            "protocol": "socks",
+            "settings": { "auth": "noauth", "udp": true },
+            "sniffing": sniffing
+        }),
+        json!({
+            "tag": "http-in",
+            "listen": listen,
+            "port": s.http_port,
+            "protocol": "http",
+            "settings": {},
+            "sniffing": sniffing
+        }),
+    ];
+
+    if s.transparent {
+        // Receives whatever nftables redirects here. `followRedirect` is what
+        // makes dokodemo-door read the original destination out of the socket
+        // rather than using a fixed address.
+        inbounds.push(json!({
+            "tag": "tproxy-in",
+            "listen": "0.0.0.0",
+            "port": s.tproxy_port,
+            "protocol": "dokodemo-door",
+            "settings": { "network": "tcp,udp", "followRedirect": true },
+            "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
+            "sniffing": sniffing
+        }));
+    }
+
+    let outbounds = json!([
+        build_outbound(node, s.transparent),
+        {
+            "tag": "direct",
+            "protocol": "freedom",
+            "settings": { "domainStrategy": "UseIP" },
+            "streamSettings": { "sockopt": sockopt_mark(s.transparent) }
+        },
+        { "tag": "block", "protocol": "blackhole", "settings": {} }
+    ]);
+
+    Some(json!({
+        "log": { "loglevel": s.log_level },
+        "dns": build_dns(state),
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [
+                { "type": "field", "ip": PRIVATE_NETS, "outboundTag": "direct" }
+            ]
+        }
+    }))
+}
+
+/// DNS block. The resolvers come from the panel's preset picker.
+///
+/// In this build the panel only serves SOCKS/HTTP inbounds, so these servers
+/// resolve names for the routing engine and for the `direct` outbound -- they
+/// are not yet the LAN's DNS. That happens once transparent proxying lands.
+fn build_dns(state: &State) -> Value {
+    let servers = dnscfg::resolvers(&state.settings);
+    json!({
+        "servers": servers,
+        "queryStrategy": "UseIP",
+        "disableFallback": false,
+        "tag": "dns-out"
+    })
+}
+
+/// The `sockopt` block that stamps Xray's own sockets with
+/// [`crate::tproxy::XRAY_MARK`].
+///
+/// This is the guard that stops the tunnel eating itself: the nftables
+/// `intercept` chain returns early on this mark, so Xray's connection to the
+/// remote server is never re-intercepted. Only emitted in transparent mode,
+/// where it is load-bearing.
+fn sockopt_mark(transparent: bool) -> Value {
+    if transparent {
+        json!({ "mark": crate::tproxy::XRAY_MARK })
+    } else {
+        json!({})
+    }
+}
+
+fn build_outbound(node: &Node, transparent: bool) -> Value {
+    let mut stream = build_stream(node);
+    if transparent {
+        if let Some(obj) = stream.as_object_mut() {
+            obj.insert("sockopt".into(), sockopt_mark(true));
+        }
+    }
+    json!({
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": node.server,
+                "port": node.port,
+                "users": [build_user(node)]
+            }]
+        },
+        "streamSettings": stream
+    })
+}
+
+fn build_user(node: &Node) -> Value {
+    let mut user = Map::new();
+    user.insert("id".into(), json!(node.uuid));
+    user.insert("encryption".into(), json!(non_empty(&node.encryption, "none")));
+    user.insert("level".into(), json!(0));
+    if !node.flow.is_empty() {
+        user.insert("flow".into(), json!(node.flow));
+    }
+    Value::Object(user)
+}
+
+fn build_stream(node: &Node) -> Value {
+    let mut stream = Map::new();
+    stream.insert("network".into(), json!(node.network));
+    stream.insert("security".into(), json!(non_empty(&node.security, "none")));
+
+    match node.security.as_str() {
+        "reality" => {
+            let mut r = Map::new();
+            r.insert("serverName".into(), json!(node.sni));
+            r.insert("publicKey".into(), json!(node.public_key));
+            r.insert("shortId".into(), json!(node.short_id));
+            r.insert("spiderX".into(), json!(non_empty(&node.spider_x, "/")));
+            // Xray rejects an empty fingerprint for REALITY.
+            r.insert(
+                "fingerprint".into(),
+                json!(non_empty(&node.fingerprint, "chrome")),
+            );
+            stream.insert("realitySettings".into(), Value::Object(r));
+        }
+        "tls" => {
+            let mut t = Map::new();
+            // Fall back to the Host header, then the address, mirroring what
+            // clients do when a link omits `sni`.
+            let sni = if !node.sni.is_empty() {
+                &node.sni
+            } else if !node.host.is_empty() {
+                &node.host
+            } else {
+                &node.server
+            };
+            t.insert("serverName".into(), json!(sni));
+            t.insert("allowInsecure".into(), json!(node.allow_insecure));
+            if !node.fingerprint.is_empty() {
+                t.insert("fingerprint".into(), json!(node.fingerprint));
+            }
+            let alpn: Vec<&str> = node
+                .alpn
+                .split(',')
+                .map(|a| a.trim())
+                .filter(|a| !a.is_empty())
+                .collect();
+            if !alpn.is_empty() {
+                t.insert("alpn".into(), json!(alpn));
+            }
+            stream.insert("tlsSettings".into(), Value::Object(t));
+        }
+        _ => {}
+    }
+
+    match node.network.as_str() {
+        "ws" => {
+            let mut w = Map::new();
+            w.insert("path".into(), json!(non_empty(&node.path, "/")));
+            if !node.host.is_empty() {
+                w.insert("host".into(), json!(node.host));
+            }
+            stream.insert("wsSettings".into(), Value::Object(w));
+        }
+        "grpc" => {
+            let mut g = Map::new();
+            g.insert("serviceName".into(), json!(node.service_name));
+            g.insert("multiMode".into(), json!(node.mode == "multi"));
+            stream.insert("grpcSettings".into(), Value::Object(g));
+        }
+        "xhttp" | "splithttp" => {
+            let mut x = Map::new();
+            x.insert("path".into(), json!(non_empty(&node.path, "/")));
+            if !node.host.is_empty() {
+                x.insert("host".into(), json!(node.host));
+            }
+            x.insert("mode".into(), json!(non_empty(&node.mode, "auto")));
+            stream.insert("xhttpSettings".into(), Value::Object(x));
+        }
+        "httpupgrade" => {
+            let mut h = Map::new();
+            h.insert("path".into(), json!(non_empty(&node.path, "/")));
+            if !node.host.is_empty() {
+                h.insert("host".into(), json!(node.host));
+            }
+            stream.insert("httpupgradeSettings".into(), Value::Object(h));
+        }
+        // Plain TCP needs no extra block.
+        _ => {}
+    }
+
+    Value::Object(stream)
+}
+
+fn non_empty<'a>(v: &'a str, default: &'a str) -> &'a str {
+    if v.is_empty() {
+        default
+    } else {
+        v
+    }
+}
+
+/// Where the daemon keeps its runtime files.
+#[derive(Debug, Clone)]
+pub struct Paths {
+    /// Generated Xray config. Lives on tmpfs to spare the router's flash.
+    pub config: PathBuf,
+    /// Xray's stdout/stderr.
+    pub log: PathBuf,
+}
+
+impl Paths {
+    pub fn new(runtime_dir: &Path) -> Self {
+        Self {
+            config: runtime_dir.join("config.json"),
+            log: runtime_dir.join("xray.log"),
+        }
+    }
+}
+
+/// Owns the Xray child process.
+pub struct Supervisor {
+    paths: Paths,
+    child: Option<Child>,
+    /// Reason the last `apply` or `stop` failed; empty when healthy.
+    pub last_error: String,
+    /// Unix seconds when the current process started.
+    pub started_at: u64,
+    /// Node id the running process was built for.
+    pub running_node: String,
+}
+
+impl Supervisor {
+    pub fn new(paths: Paths) -> Self {
+        Self {
+            paths,
+            child: None,
+            last_error: String::new(),
+            started_at: 0,
+            running_node: String::new(),
+        }
+    }
+
+    /// True if the child is alive. Reaps it if it has exited.
+    pub fn is_running(&mut self) -> bool {
+        let Some(child) = self.child.as_mut() else {
+            return false;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // Exited on its own -- record why so the panel can show it.
+                self.last_error = format!("xray exited ({status})");
+                self.child = None;
+                self.started_at = 0;
+                self.running_node.clear();
+                false
+            }
+            Ok(None) => true,
+            Err(e) => {
+                self.last_error = format!("cannot poll xray: {e}");
+                false
+            }
+        }
+    }
+
+    /// Regenerates the config and restarts Xray to match `state`.
+    ///
+    /// With no node selected this stops Xray and succeeds -- "off" is a valid
+    /// state, not an error.
+    pub fn apply(&mut self, state: &State) -> Result<(), String> {
+        self.stop();
+
+        let Some(config) = build_config(state) else {
+            self.last_error.clear();
+            return Ok(());
+        };
+
+        if let Some(dir) = self.paths.config.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+        let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
+        write_atomic(&self.paths.config, &body)
+            .map_err(|e| format!("cannot write config: {e}"))?;
+
+        let bin = &state.settings.xray_bin;
+        if !Path::new(bin).exists() {
+            let msg = format!("xray binary not found at {bin}");
+            self.last_error = msg.clone();
+            return Err(msg);
+        }
+
+        // Truncate rather than append: the log is a debugging aid, and an
+        // unbounded file on tmpfs would eat the router's RAM.
+        let log = File::create(&self.paths.log)
+            .map_err(|e| format!("cannot open {}: {e}", self.paths.log.display()))?;
+        let log_err = log
+            .try_clone()
+            .map_err(|e| format!("cannot duplicate log handle: {e}"))?;
+
+        let mut cmd = Command::new(bin);
+        cmd.arg("run")
+            .arg("-c")
+            .arg(&self.paths.config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err));
+        set_die_with_parent(&mut cmd);
+
+        let child = cmd.spawn().map_err(|e| format!("cannot start xray: {e}"))?;
+
+        self.child = Some(child);
+        self.started_at = now_secs();
+        self.running_node = state.active.clone();
+        self.last_error.clear();
+
+        self.wait_until_settled()
+    }
+
+    /// Confirms the child is still alive a moment after spawning.
+    ///
+    /// Xray parses its config and binds its inbounds during startup, so a bad
+    /// node, an unusable DNS entry or a port clash all show up as an exit
+    /// within a few hundred milliseconds. Returning straight from `spawn`
+    /// would report those as a successful start, and the panel would show
+    /// "connected" for a process that is already gone.
+    fn wait_until_settled(&mut self) -> Result<(), String> {
+        let deadline = Instant::now() + SETTLE;
+        while Instant::now() < deadline {
+            thread::sleep(POLL);
+            if !self.is_running() {
+                // `is_running` already recorded the exit status; prefer the
+                // log line, which says *why*.
+                let detail = last_error_line(&self.log_tail(40));
+                let msg = if detail.is_empty() {
+                    self.last_error.clone()
+                } else {
+                    detail
+                };
+                self.last_error = msg.clone();
+                return Err(msg);
+            }
+        }
+        Ok(())
+    }
+
+    /// Stops Xray if it is running. Safe to call when it is not.
+    pub fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            // Reap it so we do not leave a zombie behind.
+            let _ = child.wait();
+        }
+        self.started_at = 0;
+        self.running_node.clear();
+    }
+
+    /// Tail of the Xray log, most recent `lines` lines.
+    pub fn log_tail(&self, lines: usize) -> String {
+        let Ok(text) = fs::read_to_string(&self.paths.log) else {
+            return String::new();
+        };
+        let all: Vec<&str> = text.lines().collect();
+        let start = all.len().saturating_sub(lines);
+        all[start..].join("\n")
+    }
+
+    pub fn config_path(&self) -> &Path {
+        &self.paths.config
+    }
+}
+
+impl Drop for Supervisor {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Picks the most informative line out of an Xray log for error reporting.
+///
+/// Xray prints its failure reason on the last non-empty line; the banner it
+/// writes on every start would otherwise mask it.
+fn last_error_line(log: &str) -> String {
+    log.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| {
+            !l.is_empty()
+                && !l.starts_with("Xray ")
+                && !l.starts_with("A unified platform")
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Asks the kernel to signal the child if this process dies.
+///
+/// [`Drop`] and a SIGTERM handler only cover orderly shutdown. A SIGKILL, an
+/// OOM kill or a panic-abort would otherwise leave Xray running unsupervised
+/// with the proxy ports held, so the next start fails with "address in use".
+/// `PR_SET_PDEATHSIG` closes that gap in the kernel.
+#[cfg(target_os = "linux")]
+fn set_die_with_parent(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    let parent = std::process::id() as libc::pid_t;
+    // SAFETY: the closure runs between fork and exec, so it must only make
+    // async-signal-safe calls. prctl and getppid are both single syscalls.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent can die between fork and the prctl above, and the
+            // signal would then never arrive. Detect that and refuse to exec
+            // rather than leak the very process this is meant to prevent.
+            if libc::getppid() != parent {
+                return Err(std::io::Error::other(
+                    "parent exited before xray could be supervised",
+                ));
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_die_with_parent(_cmd: &mut Command) {}
+
+/// Writes via a temp file and rename, so a crash mid-write cannot leave a
+/// truncated config that Xray would refuse to start with.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
+}
+
+pub fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parse::parse_uri;
+
+    fn state_with(uri: &str) -> State {
+        let node = parse_uri(uri).unwrap();
+        let mut s = State::default();
+        s.active = node.id.clone();
+        s.nodes.push(node);
+        s
+    }
+
+    #[test]
+    fn no_selection_yields_no_config() {
+        assert!(build_config(&State::default()).is_none());
+    }
+
+    #[test]
+    fn reality_outbound_has_required_fields() {
+        let s = state_with(
+            "vless://uu@ex.com:443?security=reality&pbk=KEY&sid=ab12&sni=www.apple.com\
+             &flow=xtls-rprx-vision&type=tcp#n",
+        );
+        let cfg = build_config(&s).unwrap();
+        let ob = &cfg["outbounds"][0];
+        assert_eq!(ob["protocol"], "vless");
+        assert_eq!(ob["settings"]["vnext"][0]["address"], "ex.com");
+        assert_eq!(ob["settings"]["vnext"][0]["users"][0]["flow"], "xtls-rprx-vision");
+        let r = &ob["streamSettings"]["realitySettings"];
+        assert_eq!(r["publicKey"], "KEY");
+        assert_eq!(r["shortId"], "ab12");
+        assert_eq!(r["serverName"], "www.apple.com");
+        assert_eq!(r["fingerprint"], "chrome", "must default, xray rejects empty");
+        assert_eq!(r["spiderX"], "/");
+    }
+
+    #[test]
+    fn flow_is_omitted_when_absent() {
+        let s = state_with("vless://uu@ex.com:443?type=ws&security=tls#n");
+        let cfg = build_config(&s).unwrap();
+        let user = &cfg["outbounds"][0]["settings"]["vnext"][0]["users"][0];
+        assert!(user.get("flow").is_none());
+    }
+
+    #[test]
+    fn ws_tls_stream_is_complete() {
+        let s = state_with(
+            "vless://uu@ex.com:8443?type=ws&security=tls&path=%2Fabc&host=cdn.example.com\
+             &alpn=h2%2Chttp%2F1.1&fp=firefox#n",
+        );
+        let st = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"];
+        assert_eq!(st["network"], "ws");
+        assert_eq!(st["wsSettings"]["path"], "/abc");
+        assert_eq!(st["wsSettings"]["host"], "cdn.example.com");
+        assert_eq!(st["tlsSettings"]["serverName"], "cdn.example.com");
+        assert_eq!(st["tlsSettings"]["alpn"][0], "h2");
+        assert_eq!(st["tlsSettings"]["alpn"][1], "http/1.1");
+        assert_eq!(st["tlsSettings"]["fingerprint"], "firefox");
+    }
+
+    #[test]
+    fn tls_sni_falls_back_to_host_then_address() {
+        let s = state_with("vless://uu@1.2.3.4:443?type=tcp&security=tls#n");
+        let st = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"];
+        assert_eq!(st["tlsSettings"]["serverName"], "1.2.3.4");
+    }
+
+    #[test]
+    fn grpc_multi_mode_is_derived_from_mode() {
+        let s = state_with("vless://uu@ex.com:443?type=grpc&serviceName=svc&mode=multi#n");
+        let st = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"];
+        assert_eq!(st["grpcSettings"]["serviceName"], "svc");
+        assert_eq!(st["grpcSettings"]["multiMode"], true);
+    }
+
+    #[test]
+    fn private_ranges_route_direct() {
+        let s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        let cfg = build_config(&s).unwrap();
+        let rule = &cfg["routing"]["rules"][0];
+        assert_eq!(rule["outboundTag"], "direct");
+        let ips = rule["ip"].as_array().unwrap();
+        assert!(ips.iter().any(|v| v == "192.168.0.0/16"));
+    }
+
+    #[test]
+    fn transparent_mode_is_off_by_default() {
+        let s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        let cfg = build_config(&s).unwrap();
+        let tags: Vec<&str> = cfg["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["tag"].as_str().unwrap())
+            .collect();
+        assert_eq!(tags, ["socks-in", "http-in"]);
+    }
+
+    #[test]
+    fn transparent_mode_adds_the_tproxy_inbound() {
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        s.settings.transparent = true;
+        s.settings.tproxy_port = 12345;
+        let cfg = build_config(&s).unwrap();
+
+        let tproxy = cfg["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["tag"] == "tproxy-in")
+            .expect("tproxy inbound");
+        assert_eq!(tproxy["port"], 12345);
+        assert_eq!(tproxy["protocol"], "dokodemo-door");
+        assert_eq!(tproxy["streamSettings"]["sockopt"]["tproxy"], "tproxy");
+        assert_eq!(
+            tproxy["settings"]["followRedirect"], true,
+            "without this the original destination is lost"
+        );
+        assert_eq!(tproxy["settings"]["network"], "tcp,udp");
+    }
+
+    /// The mark on xray's own sockets is what the nftables `intercept` chain
+    /// returns on. Without it, xray's connection to the server is itself
+    /// intercepted and the router recurses to death.
+    #[test]
+    fn transparent_mode_marks_xray_own_sockets() {
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp&security=reality&pbk=K#n");
+        s.settings.transparent = true;
+        let cfg = build_config(&s).unwrap();
+
+        assert_eq!(
+            cfg["outbounds"][0]["streamSettings"]["sockopt"]["mark"],
+            crate::tproxy::XRAY_MARK
+        );
+        assert_eq!(
+            cfg["outbounds"][1]["streamSettings"]["sockopt"]["mark"],
+            crate::tproxy::XRAY_MARK,
+            "the direct outbound needs it too, or direct traffic loops"
+        );
+    }
+
+    #[test]
+    fn marking_does_not_disturb_the_rest_of_the_stream_config() {
+        let mut s = state_with(
+            "vless://uu@ex.com:443?type=ws&security=tls&path=%2Fx&host=cdn.example.com#n",
+        );
+        s.settings.transparent = true;
+        let st = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"];
+        assert_eq!(st["network"], "ws");
+        assert_eq!(st["wsSettings"]["path"], "/x");
+        assert_eq!(st["tlsSettings"]["serverName"], "cdn.example.com");
+        assert_eq!(st["sockopt"]["mark"], crate::tproxy::XRAY_MARK);
+    }
+
+    #[test]
+    fn no_mark_when_transparent_is_off() {
+        let s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        let cfg = build_config(&s).unwrap();
+        assert!(cfg["outbounds"][0]["streamSettings"].get("sockopt").is_none());
+    }
+
+    #[test]
+    fn error_line_skips_the_startup_banner() {
+        let banner = "Xray 26.7.28 (Xray, Penetrates Everything.)\n\
+                      A unified platform for anti-censorship.\n";
+        assert_eq!(last_error_line(banner), "");
+        assert_eq!(
+            last_error_line(&format!("{banner}failed to listen: address already in use\n")),
+            "failed to listen: address already in use"
+        );
+    }
+
+    #[cfg(unix)]
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xrayop-{name}-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// The whole point of the settle window: a core that dies on startup must
+    /// surface as an error, not as "connected".
+    #[cfg(unix)]
+    #[test]
+    fn a_core_that_exits_immediately_is_a_failed_start() {
+        let dir = scratch("settle-fail");
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        s.settings.xray_bin = "/bin/false".into();
+
+        let mut sup = Supervisor::new(Paths::new(&dir));
+        let err = sup.apply(&s).expect_err("a core that exits must not report success");
+        assert!(!err.is_empty(), "the failure needs a reason");
+        assert!(!sup.is_running());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_core_that_keeps_running_is_a_successful_start() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch("settle-ok");
+        let fake = dir.join("fake-xray");
+        fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        s.settings.xray_bin = fake.display().to_string();
+
+        let mut sup = Supervisor::new(Paths::new(&dir));
+        sup.apply(&s).expect("a live core should start cleanly");
+        assert!(sup.is_running());
+        assert_eq!(sup.running_node, s.active);
+        assert!(sup.last_error.is_empty());
+
+        sup.stop();
+        assert!(!sup.is_running());
+    }
+
+    #[test]
+    fn missing_binary_is_reported_clearly() {
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        s.settings.xray_bin = "/definitely/not/here/xray".into();
+        let dir = std::env::temp_dir().join("xrayop-missing-bin");
+        let _ = fs::create_dir_all(&dir);
+        let err = Supervisor::new(Paths::new(&dir)).apply(&s).unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn lan_binding_follows_setting() {
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        s.settings.allow_lan = false;
+        let cfg = build_config(&s).unwrap();
+        assert_eq!(cfg["inbounds"][0]["listen"], "127.0.0.1");
+        assert_eq!(cfg["inbounds"][0]["port"], 1080);
+        assert_eq!(cfg["inbounds"][1]["port"], 1081);
+    }
+}

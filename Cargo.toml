@@ -1,0 +1,31 @@
+[package]
+name = "xrayop"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight Xray manager with a browser panel for OpenWrt routers"
+license = "MIT"
+
+[[bin]]
+name = "xrayopd"
+path = "src/main.rs"
+
+[dependencies]
+# Blocking HTTP server. No TLS features -- the panel is LAN-only.
+tiny_http = { version = "0.12", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+percent-encoding = "2"
+
+# Declarations only, no C to compile. Used for PR_SET_PDEATHSIG so a killed
+# daemon cannot leave an orphaned xray behind, and for SIGTERM handling.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"     # optimise for size; this runs on a router
+lto = true
+codegen-units = 1
+strip = true
+# panic = "unwind" (default) is deliberate: a panic in one request handler
+# must not take down the whole daemon. See http::spawn_worker.

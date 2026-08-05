@@ -1,0 +1,7 @@
+# Cross-compiling to the router (Google WiFi / IPQ4019, armv7 musl).
+#
+# Every dependency in this project is pure Rust, so no C cross-toolchain is
+# needed -- rust-lld links against the musl libc that rustup ships with the
+# target. That is the whole reason the dependency list is kept to four crates.
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"
