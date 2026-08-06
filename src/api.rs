@@ -1263,7 +1263,7 @@ mod tests {
     #[test]
     fn node_list_omits_credentials() {
         let n: Node = parse_uri(
-            "vless://secret-uuid@ex.com:443?security=reality&pbk=KEY&sid=ab#n",
+            "vless://secret-uuid@ex.com:443?security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=ab#n",
         )
         .unwrap();
         let listed = json!({
@@ -1276,7 +1276,7 @@ mod tests {
         }
         let text = listed.to_string();
         assert!(!text.contains("secret-uuid"));
-        assert!(!text.contains("KEY"));
+        assert!(!text.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
     }
 
     #[test]

@@ -72,10 +72,15 @@ pub fn parse_uri(uri: &str) -> Result<Node, String> {
         // `type` is the modern key; `net` appears in older generators.
         let t = q.get("type");
         let t = if t.is_empty() { q.get("net") } else { t };
-        if t.is_empty() {
-            "tcp".into()
-        } else {
-            t
+        // One spelling reaches the rest of the code. Xray accepts `raw` and
+        // `tcp` as the same transport, and `splithttp` and `xhttp` likewise;
+        // normalising here means every match arm and every check downstream has
+        // exactly one string to consider.
+        match t.as_str() {
+            "" => "tcp".into(),
+            "raw" => "tcp".into(),
+            "splithttp" => "xhttp".into(),
+            _ => t,
         }
     };
     node.security = q.get_or("security", "none");
@@ -106,19 +111,112 @@ pub fn parse_uri(uri: &str) -> Result<Node, String> {
     node.mode = q.get("mode");
     node.header_type = q.get("headerType");
     node.allow_insecure = {
-        let a = q.get("allowInsecure");
-        let a = if a.is_empty() { q.get("insecure") } else { a };
+        // Three spellings are in circulation; generators disagree.
+        let a = ["allowInsecure", "insecure", "allow_insecure"]
+            .iter()
+            .map(|k| q.get(k))
+            .find(|v| !v.is_empty())
+            .unwrap_or_default();
         a == "1" || a.eq_ignore_ascii_case("true")
     };
+    node.verify_peer_cert_by_name = q.get("vcn");
+    node.pinned_peer_cert_sha256 = q.get("pcs");
+    node.ech_config_list = q.get("ech");
+    node.mldsa65_verify = q.get("pqv");
 
-    // REALITY without a public key can never complete a handshake; catching it
-    // here turns a silent connection failure into a visible import error.
-    if node.security == "reality" && node.public_key.is_empty() {
-        return Err("reality link is missing the pbk (public key) parameter".into());
-    }
-
+    validate(&node)?;
     node.id = node.compute_id();
     Ok(node)
+}
+
+/// Rejects links Xray would refuse, at the moment they are imported.
+///
+/// Every one of these is a *hard* error inside Xray, not a warning: the config
+/// fails to load and the core does not start. Because one config carries every
+/// node, a single bad link takes down the whole instance -- so an unusable link
+/// has to be caught here, where it can be reported against the line it came
+/// from, rather than at start-up where it looks like a crash.
+///
+/// Line references are to Xray-core 26.x `infra/conf/`.
+fn validate(node: &Node) -> Result<(), String> {
+    // Removed transports. Xray answers these with PrintRemovedFeatureError.
+    match node.network.as_str() {
+        "h2" | "http" | "h3" => {
+            return Err("the HTTP/2 transport was removed from Xray; ask the provider for a ws, grpc or xhttp link".into())
+        }
+        "quic" => return Err("the QUIC transport was removed from Xray".into()),
+        // mKCP survives, but its `header` and `seed` -- the only reason a share
+        // link ever specifies it -- do not.
+        "kcp" | "mkcp" => {
+            return Err("mKCP header and seed were removed from Xray, so this link cannot be used".into())
+        }
+        "tcp" | "ws" | "grpc" | "xhttp" | "httpupgrade" => {}
+        other => return Err(format!("unknown transport \"{other}\"")),
+    }
+
+    match node.security.as_str() {
+        "xtls" => return Err("legacy XTLS was removed from Xray; this link needs reality or tls".into()),
+        "none" | "tls" | "reality" => {}
+        other => return Err(format!("unknown security \"{other}\"")),
+    }
+
+    if node.security == "reality" {
+        // "REALITY only supports RAW, XHTTP and gRPC for now."
+        if !matches!(node.network.as_str(), "tcp" | "xhttp" | "grpc") {
+            return Err(format!(
+                "reality cannot run over {}; Xray allows only tcp, xhttp and grpc",
+                node.network
+            ));
+        }
+        if node.public_key.is_empty() {
+            return Err("reality link is missing the pbk (public key) parameter".into());
+        }
+        // 32 bytes, unpadded base64url. A truncated key is a common copy/paste
+        // failure and produces a handshake error with no useful message.
+        if base64url_len(&node.public_key) != Some(32) {
+            return Err("reality pbk is not a 32-byte key; the link looks truncated".into());
+        }
+        if node.short_id.len() > 16 || !node.short_id.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("reality sid must be at most 16 hex characters".into());
+        }
+        if !node.spider_x.is_empty() && !node.spider_x.starts_with('/') {
+            return Err("reality spx must start with '/'".into());
+        }
+    }
+
+    // Only these three are accepted on an outbound; anything else is refused.
+    if !matches!(
+        node.flow.as_str(),
+        "" | "xtls-rprx-vision" | "xtls-rprx-vision-udp443"
+    ) {
+        return Err(format!("Xray does not accept the flow \"{}\"", node.flow));
+    }
+
+    if node.network == "xhttp"
+        && !matches!(
+            node.mode.as_str(),
+            "" | "auto" | "packet-up" | "stream-up" | "stream-one"
+        )
+    {
+        return Err(format!("unknown xhttp mode \"{}\"", node.mode));
+    }
+
+    Ok(())
+}
+
+/// Decoded length of an unpadded base64url string, or `None` if it is not one.
+fn base64url_len(s: &str) -> Option<usize> {
+    let s = s.trim_end_matches('=');
+    if s.is_empty() || !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    // 4 characters carry 3 bytes; a trailing group of 2 or 3 carries 1 or 2.
+    match s.len() % 4 {
+        0 => Some(s.len() / 4 * 3),
+        2 => Some(s.len() / 4 * 3 + 1),
+        3 => Some(s.len() / 4 * 3 + 2),
+        _ => None, // a remainder of 1 cannot occur in valid base64
+    }
 }
 
 /// Splits `host:port`, honouring the `[::1]:443` form for IPv6 literals.
@@ -283,17 +381,142 @@ mod tests {
     fn parses_reality_tcp_link() {
         let uri = "vless://11111111-2222-3333-4444-555555555555@example.com:443\
                    ?encryption=none&security=reality&sni=www.microsoft.com&fp=chrome\
-                   &pbk=ABCDEF&sid=0123abcd&spx=%2F&type=tcp&flow=xtls-rprx-vision#My%20Node";
+                   &pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=0123abcd&spx=%2F&type=tcp&flow=xtls-rprx-vision#My%20Node";
         let n = parse_uri(uri).expect("should parse");
         assert_eq!(n.server, "example.com");
         assert_eq!(n.port, 443);
         assert_eq!(n.security, "reality");
         assert_eq!(n.sni, "www.microsoft.com");
-        assert_eq!(n.public_key, "ABCDEF");
+        assert_eq!(n.public_key, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(n.short_id, "0123abcd");
         assert_eq!(n.spider_x, "/");
         assert_eq!(n.flow, "xtls-rprx-vision");
         assert_eq!(n.name, "My Node");
+    }
+
+    /// A valid 32-byte REALITY key: 43 unpadded base64url characters.
+    const PBK: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    /// One config carries every node, so a link Xray refuses does not fail
+    /// alone -- it stops the core and takes the whole server list with it.
+    /// Catching these at import turns that into one visible error on one line.
+    #[test]
+    fn transports_xray_removed_are_refused_at_import() {
+        for (t, expect) in [
+            ("h2", "HTTP/2"),
+            ("http", "HTTP/2"),
+            ("quic", "QUIC"),
+            ("kcp", "mKCP"),
+            ("mkcp", "mKCP"),
+            ("carrier-pigeon", "unknown transport"),
+        ] {
+            let e = parse_uri(&format!("vless://u@ex.com:443?type={t}#n")).unwrap_err();
+            assert!(e.contains(expect), "type={t} gave {e:?}");
+        }
+    }
+
+    #[test]
+    fn legacy_xtls_and_unknown_security_are_refused() {
+        assert!(parse_uri("vless://u@ex.com:443?security=xtls#n")
+            .unwrap_err()
+            .contains("XTLS"));
+        assert!(parse_uri("vless://u@ex.com:443?security=magic#n")
+            .unwrap_err()
+            .contains("unknown security"));
+    }
+
+    /// Xray: "REALITY only supports RAW, XHTTP and gRPC for now."
+    #[test]
+    fn reality_is_refused_on_transports_it_cannot_use() {
+        for t in ["ws", "httpupgrade"] {
+            let e = parse_uri(&format!(
+                "vless://u@ex.com:443?security=reality&type={t}&pbk={PBK}#n"
+            ))
+            .unwrap_err();
+            assert!(e.contains("reality cannot run over"), "type={t} gave {e:?}");
+        }
+        for t in ["tcp", "xhttp", "grpc"] {
+            assert!(
+                parse_uri(&format!(
+                    "vless://u@ex.com:443?security=reality&type={t}&pbk={PBK}#n"
+                ))
+                .is_ok(),
+                "type={t} should be allowed"
+            );
+        }
+    }
+
+    /// A key that lost characters in a copy/paste produces a handshake failure
+    /// with nothing useful in the log, which is a miserable thing to debug.
+    #[test]
+    fn a_truncated_reality_key_is_caught() {
+        let e = parse_uri("vless://u@ex.com:443?security=reality&pbk=ABCDEF#n").unwrap_err();
+        assert!(e.contains("32-byte"), "{e}");
+        assert!(parse_uri(&format!("vless://u@ex.com:443?security=reality&pbk={PBK}#n")).is_ok());
+    }
+
+    #[test]
+    fn reality_short_id_must_be_hex_and_spider_x_a_path() {
+        let bad_sid =
+            parse_uri(&format!("vless://u@e.com:443?security=reality&pbk={PBK}&sid=zzz#n"))
+                .unwrap_err();
+        assert!(bad_sid.contains("hex"), "{bad_sid}");
+        let bad_spx =
+            parse_uri(&format!("vless://u@e.com:443?security=reality&pbk={PBK}&spx=x#n"))
+                .unwrap_err();
+        assert!(bad_spx.contains("spx"), "{bad_spx}");
+    }
+
+    #[test]
+    fn only_the_three_flows_xray_accepts_are_allowed() {
+        for f in ["xtls-rprx-vision", "xtls-rprx-vision-udp443"] {
+            assert!(parse_uri(&format!("vless://u@e.com:443?flow={f}#n")).is_ok(), "{f}");
+        }
+        // xtls-rprx-direct and friends were removed years ago but still appear.
+        let e = parse_uri("vless://u@e.com:443?flow=xtls-rprx-direct#n").unwrap_err();
+        assert!(e.contains("flow"), "{e}");
+    }
+
+    #[test]
+    fn an_unknown_xhttp_mode_is_caught() {
+        assert!(parse_uri("vless://u@e.com:443?type=xhttp&mode=stream-one#n").is_ok());
+        let e = parse_uri("vless://u@e.com:443?type=xhttp&mode=turbo#n").unwrap_err();
+        assert!(e.contains("xhttp mode"), "{e}");
+    }
+
+    /// Xray takes both spellings of each; carrying two through the codebase
+    /// would mean every downstream match had to remember it.
+    #[test]
+    fn transport_aliases_are_normalised_at_the_door() {
+        assert_eq!(parse_uri("vless://u@e.com:443?type=raw#n").unwrap().network, "tcp");
+        assert_eq!(
+            parse_uri("vless://u@e.com:443?type=splithttp#n").unwrap().network,
+            "xhttp"
+        );
+    }
+
+    #[test]
+    fn the_replacements_for_allow_insecure_are_parsed() {
+        let n = parse_uri(
+            "vless://u@e.com:443?security=tls&vcn=a.com,b.com&pcs=AA:BB&ech=abc123&insecure=1#n",
+        )
+        .unwrap();
+        assert_eq!(n.verify_peer_cert_by_name, "a.com,b.com");
+        assert_eq!(n.pinned_peer_cert_sha256, "AA:BB");
+        assert_eq!(n.ech_config_list, "abc123");
+        assert!(n.allow_insecure, "the link's request is recorded");
+    }
+
+    /// Three spellings are in circulation and generators disagree.
+    #[test]
+    fn every_spelling_of_allow_insecure_is_understood() {
+        for q in ["allowInsecure=1", "insecure=true", "allow_insecure=1"] {
+            assert!(
+                parse_uri(&format!("vless://u@e.com:443?{q}#n")).unwrap().allow_insecure,
+                "{q}"
+            );
+        }
+        assert!(!parse_uri("vless://u@e.com:443?insecure=0#n").unwrap().allow_insecure);
     }
 
     #[test]

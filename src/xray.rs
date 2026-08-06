@@ -301,6 +301,13 @@ fn build_stream(node: &Node) -> Value {
                 "fingerprint".into(),
                 json!(non_empty(&node.fingerprint, "chrome")),
             );
+            if !node.mldsa65_verify.is_empty() {
+                r.insert("mldsa65Verify".into(), json!(node.mldsa65_verify));
+            }
+            // Nothing else belongs here. REALITY has no alpn, no
+            // allowInsecure, no ech, no pinned certificates -- Xray's decoder
+            // drops unknown keys silently, so extra ones are invisible noise
+            // in a config someone may have to read on a router.
             stream.insert("realitySettings".into(), Value::Object(r));
         }
         "tls" => {
@@ -315,16 +322,31 @@ fn build_stream(node: &Node) -> Value {
                 &node.server
             };
             t.insert("serverName".into(), json!(sni));
-            t.insert("allowInsecure".into(), json!(node.allow_insecure));
+            // `allowInsecure` is deliberately never written. Xray removed it,
+            // and removed here means the config does not load at all -- a
+            // single link carrying `insecure=1` would stop the core, taking
+            // every other server with it. These two are the replacements Xray
+            // names: both still verify the chain, so neither is a way back to
+            // trusting anything.
+            if !node.verify_peer_cert_by_name.is_empty() {
+                t.insert(
+                    "verifyPeerCertByName".into(),
+                    json!(csv(&node.verify_peer_cert_by_name)),
+                );
+            }
+            if !node.pinned_peer_cert_sha256.is_empty() {
+                t.insert(
+                    "pinnedPeerCertSha256".into(),
+                    json!(csv(&node.pinned_peer_cert_sha256)),
+                );
+            }
+            if !node.ech_config_list.is_empty() {
+                t.insert("echConfigList".into(), json!(node.ech_config_list));
+            }
             if !node.fingerprint.is_empty() {
                 t.insert("fingerprint".into(), json!(node.fingerprint));
             }
-            let alpn: Vec<&str> = node
-                .alpn
-                .split(',')
-                .map(|a| a.trim())
-                .filter(|a| !a.is_empty())
-                .collect();
+            let alpn = csv(&node.alpn);
             if !alpn.is_empty() {
                 t.insert("alpn".into(), json!(alpn));
             }
@@ -442,6 +464,19 @@ fn non_empty<'a>(v: &'a str, default: &'a str) -> &'a str {
     } else {
         v
     }
+}
+
+/// Splits a comma-separated URI value into the array Xray expects.
+///
+/// Xray's `StringList` accepts either a bare string or an array, but arrays
+/// leave no doubt about where one entry ends, and a link that wrote
+/// `alpn=h2, http/1.1` with a space should not produce an entry beginning with
+/// one.
+fn csv(s: &str) -> Vec<&str> {
+    s.split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 /// Where the daemon keeps its runtime files.
@@ -936,7 +971,7 @@ mod tests {
     #[test]
     fn reality_outbound_has_required_fields() {
         let s = state_with(
-            "vless://uu@ex.com:443?security=reality&pbk=KEY&sid=ab12&sni=www.apple.com\
+            "vless://uu@ex.com:443?security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=ab12&sni=www.apple.com\
              &flow=xtls-rprx-vision&type=tcp#n",
         );
         let cfg = build_config(&s).unwrap();
@@ -945,7 +980,7 @@ mod tests {
         assert_eq!(ob["settings"]["vnext"][0]["address"], "ex.com");
         assert_eq!(ob["settings"]["vnext"][0]["users"][0]["flow"], "xtls-rprx-vision");
         let r = &ob["streamSettings"]["realitySettings"];
-        assert_eq!(r["publicKey"], "KEY");
+        assert_eq!(r["publicKey"], "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         assert_eq!(r["shortId"], "ab12");
         assert_eq!(r["serverName"], "www.apple.com");
         assert_eq!(r["fingerprint"], "chrome", "must default, xray rejects empty");
@@ -1042,7 +1077,7 @@ mod tests {
     /// intercepted and the router recurses to death.
     #[test]
     fn transparent_mode_marks_xray_own_sockets() {
-        let mut s = state_with("vless://uu@ex.com:443?type=tcp&security=reality&pbk=K#n");
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp&security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA#n");
         s.settings.transparent = true;
         let cfg = build_config(&s).unwrap();
 
@@ -1147,6 +1182,55 @@ mod tests {
         let st = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"];
         assert!(st.get("tcpSettings").is_none());
         assert_eq!(st["wsSettings"]["host"], "a.com");
+    }
+
+    /// Xray removed `allowInsecure`, and removed means the config does not
+    /// load -- not a warning, a refusal. One link carrying `insecure=1` would
+    /// stop the core and take every other server down with it. The link's
+    /// request is recorded on the node so the panel can explain itself; it
+    /// must never reach the JSON.
+    #[test]
+    fn allow_insecure_never_reaches_the_config() {
+        let s = state_with("vless://uu@ex.com:443?type=ws&security=tls&insecure=1#n");
+        assert!(
+            s.nodes[0].allow_insecure,
+            "the link asked for it, and that is worth remembering"
+        );
+        let cfg = build_config(&s).unwrap();
+        assert!(
+            !cfg.to_string().contains("allowInsecure"),
+            "emitting it would stop the core from starting at all"
+        );
+    }
+
+    /// What Xray offers instead. Both still verify the certificate chain, so
+    /// neither is a way back to trusting anything that answers.
+    #[test]
+    fn the_sanctioned_replacements_are_emitted_as_arrays() {
+        let s = state_with(
+            "vless://uu@ex.com:443?type=ws&security=tls&vcn=a.com,%20b.com&pcs=AA,BB&ech=cfg#n",
+        );
+        let t = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["tlsSettings"];
+        assert_eq!(t["verifyPeerCertByName"][1], "b.com", "whitespace trimmed");
+        assert_eq!(t["pinnedPeerCertSha256"].as_array().unwrap().len(), 2);
+        assert_eq!(t["echConfigList"], "cfg");
+    }
+
+    /// REALITY has no alpn, no allowInsecure, no pinned certificates. Xray
+    /// drops unknown keys silently, so extras are invisible noise in a config
+    /// someone may end up reading over SSH.
+    #[test]
+    fn reality_carries_only_the_keys_reality_has() {
+        let s = state_with(
+            "vless://uu@ex.com:443?type=tcp&security=reality\
+             &pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sni=a.com&alpn=h2&pqv=xyz#n",
+        );
+        let r = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["realitySettings"];
+        let keys: Vec<&String> = r.as_object().unwrap().keys().collect();
+        for absent in ["alpn", "allowInsecure", "echConfigList", "pinnedPeerCertSha256"] {
+            assert!(!keys.iter().any(|k| *k == absent), "{absent} does not belong here");
+        }
+        assert_eq!(r["mldsa65Verify"], "xyz");
     }
 
     #[test]

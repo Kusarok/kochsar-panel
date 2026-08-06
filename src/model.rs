@@ -75,8 +75,28 @@ pub struct Node {
     /// perfectly in other clients.
     #[serde(default)]
     pub header_type: String,
+    /// `allowInsecure` as the link asked for it.
+    ///
+    /// Recorded but never emitted. Xray removed the option, and a config that
+    /// still carries `allowInsecure: true` does not start at all -- it is a
+    /// hard error, not a warning. The sanctioned replacements are the two
+    /// fields below; this is kept so the panel can say why a link's request
+    /// was not honoured.
     #[serde(default)]
     pub allow_insecure: bool,
+    /// `vcn`: names the peer certificate must be valid for. The chain is still
+    /// verified, so this is narrower than the old `allowInsecure`.
+    #[serde(default)]
+    pub verify_peer_cert_by_name: String,
+    /// `pcs`: SHA-256 fingerprints the peer certificate must match.
+    #[serde(default)]
+    pub pinned_peer_cert_sha256: String,
+    /// `ech`: base64 ECHConfigList for encrypted client hello.
+    #[serde(default)]
+    pub ech_config_list: String,
+    /// `pqv`: REALITY post-quantum ML-DSA-65 verification key.
+    #[serde(default)]
+    pub mldsa65_verify: String,
 
     /// Owning subscription id; empty means the node was added by hand.
     #[serde(default)]
@@ -127,6 +147,10 @@ impl Default for Node {
             mode: String::new(),
             header_type: String::new(),
             allow_insecure: false,
+            verify_peer_cert_by_name: String::new(),
+            pinned_peer_cert_sha256: String::new(),
+            ech_config_list: String::new(),
+            mldsa65_verify: String::new(),
             sub_id: String::new(),
             latency: Node::LATENCY_UNTESTED,
             raw: String::new(),
