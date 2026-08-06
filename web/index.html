@@ -548,7 +548,6 @@ pre.log{
           </a>
         </div>
         <div class="row" style="margin-top:14px">
-          <button class="btn" id="btnRestore" data-t="restore">Restore server list</button>
           <button class="btn dang" id="btnForget" data-t="forget">Forget token</button>
         </div>
       </div>
@@ -629,8 +628,7 @@ const I18N = {
     connIdle:"Idle timeout (s)", goMem:"Go memory limit (MB)", hardCap:"Hard cap (MB, 0=off)",
     routeOnly:"Route-only sniffing",
     routeOnlyHint:"Keeps the original destination. Turning this off breaks Tor, Apple push and some IoT devices.",
-    restore:"Restore server list", forget:"Forget token",
-    restored:"{0} servers restored",
+    forget:"Forget token",
     autoSwitch:"Automatic failover", autoEnable:"Switch to the best server automatically",
     autoEnableHint:"Tests every server and moves if one is clearly better.",
     autoNote:"Every server is measured through its own connection, not through the one in use, so a failing server cannot make the others look bad. A dead server is replaced within a few minutes; a working one is only replaced when the alternative is clearly better, because every switch drops live connections.",
@@ -700,8 +698,7 @@ const I18N = {
     connIdle:"مهلت بی‌کاری (ثانیه)", goMem:"سقف حافظهٔ Go (مگابایت)", hardCap:"سقف سخت (۰ = خاموش)",
     routeOnly:"شنود فقط برای مسیریابی",
     routeOnlyHint:"مقصد اصلی را دست‌نخورده نگه می‌دارد. خاموش‌کردنش Tor، اعلان‌های اپل و بعضی دستگاه‌های IoT را می‌شکند.",
-    restore:"بازگرداندن لیست سرورها", forget:"فراموش‌کردن توکن",
-    restored:"{0} سرور بازگردانده شد",
+    forget:"فراموش‌کردن توکن",
     autoSwitch:"جایگزینی خودکار", autoEnable:"خودکار به بهترین سرور سوییچ کن",
     autoEnableHint:"همهٔ سرورها را تست می‌کند و اگر یکی آشکارا بهتر بود جابه‌جا می‌شود.",
     autoNote:"هر سرور از اتصال خودش سنجیده می‌شود، نه از سروری که در حال استفاده است — پس یک سرور خراب نمی‌تواند بقیه را بد نشان دهد. سرور قطع‌شده ظرف چند دقیقه جایگزین می‌شود؛ سرور سالم فقط وقتی عوض می‌شود که گزینهٔ دیگر آشکارا بهتر باشد، چون هر سوییچ اتصال‌های باز را قطع می‌کند.",
@@ -1187,11 +1184,6 @@ $("#btnSaveRes").onclick = () => run(() => api("/api/settings", {
 $("#swRouteOnly").onclick = () =>
   run(() => api("/api/settings", { sniff_route_only: !state.settings.sniff_route_only }));
 
-$("#btnRestore").onclick = () => run(async () => {
-  const r = await api("/api/nodes/restore", {});
-  toast(t("restored", r.restored), "good");
-  return r;
-});
 $("#btnForget").onclick = () => {
   localStorage.removeItem("xrayop.token");
   token = "";

@@ -126,7 +126,6 @@ fn dispatch(app: &Arc<Mutex<App>>, mut request: Request) {
                 "/api/tproxy/enable" => handle_tproxy_enable(app),
                 "/api/tproxy/confirm" => handle_tproxy_confirm(app),
                 "/api/tproxy/disable" => handle_tproxy_disable(app),
-                "/api/nodes/restore" => handle_restore(app),
                 "/api/mode" => handle_mode(app, &body),
                 "/api/network-changed" => handle_network_changed(app, &body),
                 _ => error(404, "no such endpoint"),
@@ -352,21 +351,6 @@ fn handle_node_remove(app: &Arc<Mutex<App>>, body: &Value) -> Body {
         return error(404, "no such node");
     }
     finish_write(app, json!({ "ok": true }))
-}
-
-/// Rolls the node list back to the previous saved generation.
-///
-/// The backup is written on every save that had nodes, so this undoes an
-/// accidental "delete all" without needing the subscription URLs again.
-fn handle_restore(app: &Arc<Mutex<App>>) -> Body {
-    let restored = {
-        let mut a = lock(app);
-        match a.restore_backup() {
-            Ok(n) => n,
-            Err(e) => return error(404, &e),
-        }
-    };
-    finish_write(app, json!({ "restored": restored }))
 }
 
 fn handle_select(app: &Arc<Mutex<App>>, body: &Value) -> Body {

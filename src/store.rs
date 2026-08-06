@@ -191,51 +191,36 @@ impl App {
         }
     }
 
-    /// Path of the previous-generation backup.
-    pub fn backup_path(&self) -> PathBuf {
-        self.state_path.with_extension("json.bak")
-    }
-
+    /// Writes the state, and only the state.
+    ///
+    /// No previous generation is kept. A subscription is the source of truth
+    /// for the servers it provides: a list that is lost is one refresh away
+    /// from coming back, and a second copy on the router's flash buys nothing
+    /// that the provider does not already hold.
     pub fn save(&self) -> Result<(), String> {
         if let Some(dir) = self.state_path.parent() {
             fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
         }
 
-        // Retyping a server list is miserable, so keep one generation back.
-        // Only overwrite the backup when the outgoing state still had nodes:
-        // that way a wipe cannot cascade into the backup on the next save and
-        // destroy the only remaining copy.
-        if let Ok(previous) = fs::read(&self.state_path) {
-            let had_nodes = serde_json::from_slice::<State>(&previous)
-                .map(|s| !s.nodes.is_empty())
-                .unwrap_or(false);
-            if had_nodes {
-                let _ = fs::write(self.backup_path(), &previous);
-            }
-            // Losing every node is either a bug or a mistake, and both are
-            // easier to deal with if the moment is on the record.
-            if had_nodes && self.state.nodes.is_empty() {
-                eprintln!(
-                    "xrayop: node list went from populated to empty; previous state kept at {}",
-                    self.backup_path().display()
-                );
+        // Losing every node is either a bug or a mistake. Nothing is kept, but
+        // the moment is worth having in the log so it is not a silent one.
+        if self.state.nodes.is_empty() {
+            if let Ok(previous) = fs::read(&self.state_path) {
+                let had_nodes = serde_json::from_slice::<State>(&previous)
+                    .map(|s| !s.nodes.is_empty())
+                    .unwrap_or(false);
+                if had_nodes {
+                    eprintln!(
+                        "xrayop: the node list went from populated to empty; \
+                         refresh a subscription to repopulate it"
+                    );
+                }
             }
         }
 
         let body = serde_json::to_vec_pretty(&self.state).map_err(|e| e.to_string())?;
         xray::write_atomic(&self.state_path, &body)
             .map_err(|e| format!("cannot write {}: {e}", self.state_path.display()))
-    }
-
-    /// Replaces live state with the backup generation.
-    pub fn restore_backup(&mut self) -> Result<usize, String> {
-        let text = fs::read_to_string(self.backup_path())
-            .map_err(|e| format!("no backup to restore: {e}"))?;
-        let restored: State =
-            serde_json::from_str(&text).map_err(|e| format!("backup is not valid JSON: {e}"))?;
-        let count = restored.nodes.len();
-        self.state = restored;
-        Ok(count)
     }
 
     /// Persists, then rebuilds and restarts Xray.
@@ -600,65 +585,25 @@ mod tests {
         App::load(dir.join("state.json"), dir).0
     }
 
+    /// Saving keeps exactly one file. A subscription can be refreshed; a
+    /// duplicate of the node list on the router's flash cannot earn its space.
     #[test]
-    fn save_keeps_one_generation_of_backup() {
-        let dir = std::env::temp_dir().join("xrayop-backup-test");
+    fn saving_leaves_no_second_copy_behind() {
+        let dir = std::env::temp_dir().join("xrayop-nocopy-test");
         let _ = fs::remove_dir_all(&dir);
         let mut app = app_at(&dir);
 
         app.add_nodes_from_text(&format!("{A}\n{B}"));
         app.save().unwrap();
-        assert!(!app.backup_path().exists(), "nothing to back up on first save");
-
         app.add_nodes_from_text(C);
         app.save().unwrap();
-        let backup: State =
-            serde_json::from_str(&fs::read_to_string(app.backup_path()).unwrap()).unwrap();
-        assert_eq!(backup.nodes.len(), 2, "backup holds the previous generation");
-    }
 
-    /// The backup is worthless if a wipe overwrites it on the following save.
-    #[test]
-    fn a_wipe_cannot_cascade_into_the_backup() {
-        let dir = std::env::temp_dir().join("xrayop-cascade-test");
-        let _ = fs::remove_dir_all(&dir);
-        let mut app = app_at(&dir);
-
-        app.add_nodes_from_text(&format!("{A}\n{B}\n{C}"));
-        app.save().unwrap();
-        app.state.nodes.clear();
-        app.save().unwrap(); // backup now holds the 3 nodes
-        app.save().unwrap(); // a second empty save must not clobber it
-        app.save().unwrap();
-
-        let backup: State =
-            serde_json::from_str(&fs::read_to_string(app.backup_path()).unwrap()).unwrap();
-        assert_eq!(backup.nodes.len(), 3, "the last populated state must survive");
-    }
-
-    #[test]
-    fn backup_can_be_restored() {
-        let dir = std::env::temp_dir().join("xrayop-restore-test");
-        let _ = fs::remove_dir_all(&dir);
-        let mut app = app_at(&dir);
-
-        app.add_nodes_from_text(&format!("{A}\n{B}"));
-        app.save().unwrap();
-        app.state.nodes.clear();
-        app.save().unwrap();
-
-        assert_eq!(app.restore_backup().unwrap(), 2);
-        assert_eq!(app.state.nodes.len(), 2);
-    }
-
-    #[test]
-    fn restoring_without_a_backup_is_an_error_not_a_wipe() {
-        let dir = std::env::temp_dir().join("xrayop-nobackup-test");
-        let _ = fs::remove_dir_all(&dir);
-        let mut app = app_at(&dir);
-        app.add_nodes_from_text(A);
-        assert!(app.restore_backup().is_err());
-        assert_eq!(app.state.nodes.len(), 1, "live state must be untouched");
+        let files: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, vec!["state.json"], "found {files:?}");
     }
 
     /// State written before `headerType` was understood still holds the URI

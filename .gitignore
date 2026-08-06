@@ -6,7 +6,6 @@
 # Runtime state holds server UUIDs and REALITY keys. It belongs in the
 # router's own backup, never in the repository.
 state.json
-state.json.bak
 *.state.json
 
 # Claude Code local tool permissions, per-machine.
