@@ -5,7 +5,7 @@ A transparent proxy manager for OpenWrt routers: one small Rust daemon, one fast
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform: OpenWrt](https://img.shields.io/badge/platform-OpenWrt%2022.03%2B-00B5E2.svg)](https://openwrt.org/)
 [![Language: Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
-[![Release](https://img.shields.io/badge/release-v0.1.0-brightgreen.svg)](#installation)
+[![Release](https://img.shields.io/badge/release-v0.2.0-brightgreen.svg)](#installation)
 
 kochsar panel drives [Xray-core](https://github.com/XTLS/Xray-core) on your router so that every device in the
 house goes through the tunnel without being configured one by one. It gives you a panel that behaves like
@@ -19,11 +19,18 @@ the whole network. It is a lightweight replacement for Passwall2: the same job, 
 ## What you get
 
 - **A panel that loads instantly.** Three tabs, a big power button, a server list. No LuCI, no page reloads.
-- **Subscriptions and share links.** Add a subscription URL and the servers arrive. Or paste `vless://` links,
-  one per line or as a base64 blob. Refreshing keeps your selection and your measured latencies.
+- **Seven protocols, one core.** `vless`, `vmess`, `trojan`, `ss`, `hysteria2`, `wireguard` and `socks` —
+  all of them running on the Xray your router already has, with no second core to install or feed.
+  Transports: raw TCP (with HTTP disguise), WebSocket, gRPC, XHTTP and HTTPUpgrade; TLS and REALITY.
+- **Subscriptions and share links.** Add a subscription URL and the servers arrive. Or paste links, one per
+  line or as a base64 blob. Refreshing keeps your selection and your measured latencies.
+- **Links that cannot work are refused when you add them,** with the reason — a Shadowsocks stream cipher, a
+  VMess server still on `alterId`, REALITY over a transport it does not support. All of these are fatal to
+  Xray, and since one config carries every server, one bad link would otherwise take the whole list down.
 - **Honest latency testing.** Every server is measured by making a real HTTPS request *through* it, to a
   destination you choose (Google, YouTube, GitHub, Telegram, Instagram, Cloudflare, OpenAI, or your own URL).
-  One tap connects to the fastest.
+  Two requests over one connection, and the warm one is reported — the same number v2rayNG shows, so the panel
+  and your phone can be compared. One tap connects to the fastest.
 - **Whole-LAN transparent proxying.** nftables TPROXY plus policy routing, so phones, TVs and consoles need no
   proxy settings at all.
 - **DNS that actually goes through the tunnel.** A dnsmasq drop-in hands the LAN's queries to Xray, so names are
@@ -42,9 +49,10 @@ the whole network. It is a lightweight replacement for Passwall2: the same job, 
   whole stack measured **38.6 MB** of RAM against Passwall2's **51.2 MB** carrying the same traffic on the same
   router.
 
-> **Status:** version 0.1.0. Transparent proxying, tunnelled DNS, crash recovery, the WAN-reconnect hook and the
-> installer have all been exercised on a real router carrying a real LAN. What is not yet established is
-> long-run behaviour under heavy use — treat this as an early release and keep SSH access handy.
+> **Status:** version 0.2.0. Transparent proxying, tunnelled DNS, crash recovery, a firmware upgrade, a reboot,
+> the WAN-reconnect hook and the installer have all been exercised on a real router carrying a real LAN. What is
+> not yet established is long-run behaviour under heavy use — treat this as an early release and keep SSH access
+> handy.
 
 ### ⚠️ Tested on one device so far
 
@@ -55,7 +63,7 @@ Everything above was verified on exactly this hardware, and nowhere else yet:
 | **Router** | Google WiFi — AC-1304 (board name `Gale`) |
 | **SoC / target** | IPQ4019, ARMv7 rev 5 (v7l), 4 cores — OpenWrt target `ipq40xx/chromium` |
 | **OpenWrt** | 25.12.2 (r32802-f505120278) |
-| **Xray-core** | 26.7.28 |
+| **Xray-core** | 26.3.27 (the version in OpenWrt's own feed) |
 | **RAM** | 494 MB total |
 
 The daemon discovers the router's own LAN interfaces, upstream resolver and dnsmasq layout at runtime rather
@@ -87,12 +95,12 @@ follow [docs/INSTALL.md](docs/INSTALL.md) instead; it walks through the same ste
 ### The short version
 
 **1. Download** the release tarball for your architecture from the Releases page, for example
-`xrayop-0.1.0-armv7-unknown-linux-musleabihf.tar.gz`.
+`xrayop-0.2.0-armv7-unknown-linux-musleabihf.tar.gz`.
 
 **2. Copy it to the router:**
 
 ```bash
-scp -O xrayop-0.1.0-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
+scp -O xrayop-0.2.0-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
 ```
 
 > `-O` is not a typo. OpenWrt's SSH server (dropbear) ships without `sftp-server`, and modern `scp` uses SFTP by
@@ -105,8 +113,8 @@ scp -O xrayop-0.1.0-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
 ```bash
 ssh root@ROUTER_IP
 cd /tmp
-tar xzf xrayop-0.1.0-*.tar.gz
-cd xrayop-0.1.0-*/
+tar xzf xrayop-0.2.0-*.tar.gz
+cd xrayop-0.2.0-*/
 sh install.sh
 ```
 
@@ -238,7 +246,7 @@ The uninstaller is in the release tarball you extracted:
 
 ```bash
 ssh root@ROUTER_IP
-cd /tmp/xrayop-0.1.0-*/
+cd /tmp/xrayop-0.2.0-*/
 sh uninstall.sh            # keeps your server list and settings
 sh uninstall.sh --purge    # removes those too
 ```
