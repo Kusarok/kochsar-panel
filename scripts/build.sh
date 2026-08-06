@@ -29,6 +29,16 @@ tar czf - Cargo.toml .cargo src web | ssh "$BUILDER" "
   tar xzf - -C ${REMOTE}
 "
 
+# The panel is compiled into the binary, so a JS syntax error ships silently:
+# the page renders blank and everything server-side looks healthy. Catch it
+# here when a parser is available.
+if command -v node >/dev/null 2>&1; then
+  echo "==> checking panel javascript"
+  sed -n '/<script>/,/<\/script>/p' web/index.html | sed '1d;$d' > /tmp/xrayop-panel.js
+  node --check /tmp/xrayop-panel.js || { echo "panel javascript does not parse" >&2; exit 1; }
+  rm -f /tmp/xrayop-panel.js
+fi
+
 echo "==> building ${TARGET}"
 ssh "$BUILDER" "
   set -e

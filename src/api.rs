@@ -1369,6 +1369,76 @@ mod tests {
         assert!(apply_settings(Default::default(), &json!({ "mem_hard_cap_mb": 0 })).is_ok());
     }
 
+    /// The panel is one file compiled into the binary, so a JavaScript syntax
+    /// error is not caught by anything the compiler does -- it ships, the page
+    /// renders blank, and the router looks fine from every angle except the
+    /// browser. That happened: an i18n entry written with a real newline
+    /// instead of an escape left a string literal unterminated, and the panel
+    /// was locked out entirely until someone thought to check the console.
+    ///
+    /// This checks the shape that broke rather than trying to parse JS. Real
+    /// parsing happens in `scripts/build.sh`, which runs `node --check` when
+    /// node is available.
+    #[test]
+    fn panel_has_no_unterminated_string_literals() {
+        let script = INDEX_HTML
+            .split_once("<script>")
+            .and_then(|(_, rest)| rest.split_once("</script>"))
+            .map(|(js, _)| js)
+            .expect("the panel must contain a script block");
+
+        for (n, line) in script.lines().enumerate() {
+            let trimmed = line.trim();
+            // An i18n entry: `key:"value",`. Anything that opens a string on a
+            // line like this has to close it on the same line.
+            let is_entry = trimmed
+                .split_once(":\"")
+                .map(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_'))
+                .unwrap_or(false);
+            if !is_entry {
+                continue;
+            }
+            let quotes = trimmed.matches('"').count() - trimmed.matches("\\\"").count();
+            assert!(
+                quotes % 2 == 0,
+                "line {} opens a string it never closes -- use \n, not a real newline:
+  {}",
+                n + 1,
+                trimmed
+            );
+        }
+    }
+
+    /// Every key the English table defines should exist in Persian, or the UI
+    /// silently falls back mid-sentence.
+    #[test]
+    fn both_languages_cover_the_same_keys() {
+        let keys = |marker: &str| -> Vec<String> {
+            let start = INDEX_HTML.find(marker).expect("language table");
+            let body = &INDEX_HTML[start..];
+            let end = body.find("
+  },").unwrap_or(body.len());
+            body[..end]
+                .lines()
+                .filter_map(|l| {
+                    let t = l.trim();
+                    t.split_once(':').and_then(|(k, _)| {
+                        let k = k.trim();
+                        (!k.is_empty()
+                            && k.chars().all(|c| c.is_alphanumeric() || c == '_')
+                            && t.contains('"'))
+                        .then(|| k.to_string())
+                    })
+                })
+                .collect()
+        };
+        let en = keys("  en: {");
+        let fa = keys("  fa: {");
+        assert!(en.len() > 40, "expected a populated table, got {}", en.len());
+        let missing: Vec<_> = en.iter().filter(|k| !fa.contains(k)).collect();
+        assert!(missing.is_empty(), "Persian is missing: {missing:?}");
+    }
+
     #[test]
     fn str_field_defaults_to_empty() {
         assert_eq!(str_field(&json!({ "a": "x" }), "a"), "x");
