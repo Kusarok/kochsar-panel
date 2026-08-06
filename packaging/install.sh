@@ -157,12 +157,51 @@ else
     ok "/etc/config/xrayop"
 fi
 
+# The core's own service.
+#
+# xrayopd starts and supervises xray itself: it validates a config before
+# swapping to it, watches the new process long enough to see it survive, and
+# tears the firewall rules down if the core cannot be kept alive at all, so the
+# LAN falls back to a direct connection instead of losing its route. A second
+# instance started by procd would compete for the same ports and defeat that.
+# OpenWrt's xray-core package ships an init script that is enabled on install,
+# so turn it off.
+if [ -x /etc/init.d/xray ] && /etc/init.d/xray enabled 2>/dev/null; then
+    /etc/init.d/xray stop >/dev/null 2>&1
+    /etc/init.d/xray disable >/dev/null 2>&1
+    ok "disabled the xray-core package's own service (xrayopd supervises the core)"
+fi
+
 # Survive sysupgrade and config-restore. The default backup only covers
 # /etc/config, which would leave the server list and the service behind.
 KEEP="/etc/init.d/xrayop
 /etc/hotplug.d/iface/99-xrayop
 /etc/xrayop/
 /usr/bin/xrayopd"
+
+# The core too, but only when no package owns it.
+#
+# A firmware upgrade wipes /usr. A packaged core comes back -- attended
+# sysupgrade rebuilds the image from the installed package list -- but a
+# hand-placed binary does not, and nothing reinstalls it. That is not
+# hypothetical: a 25.12.2 -> 25.12.5 upgrade left the daemon with its config,
+# its servers and no core to run them. Listing a packaged binary here would be
+# worse than useless, since it would preserve the old file over the new one.
+if [ -n "$XRAY" ]; then
+    owned=0
+    if command -v apk >/dev/null 2>&1; then
+        apk info --who-owns "$XRAY" >/dev/null 2>&1 && owned=1
+    elif command -v opkg >/dev/null 2>&1; then
+        opkg search "$XRAY" 2>/dev/null | grep -q . && owned=1
+    fi
+    if [ "$owned" = 0 ]; then
+        KEEP="$KEEP
+$XRAY"
+        warn "$XRAY belongs to no package; adding it to sysupgrade.conf so a"
+        warn "  firmware upgrade does not leave the daemon without a core."
+    fi
+fi
+
 for path in $KEEP; do
     grep -qxF "$path" /etc/sysupgrade.conf 2>/dev/null || echo "$path" >> /etc/sysupgrade.conf
 done

@@ -55,9 +55,11 @@ rm -f /usr/bin/xrayopd /etc/hotplug.d/iface/99-xrayop
 rm -rf /var/etc/xrayop
 say "removed the binary, the hotplug hook and the runtime files"
 
-# Leave /etc/sysupgrade.conf tidy.
+# Leave /etc/sysupgrade.conf tidy. The core's path is in here too when the
+# installer found an unpackaged binary and added it; it goes with us, since it
+# was our line.
 if [ -f /etc/sysupgrade.conf ]; then
-    sed -i '\#^/etc/init.d/xrayop$#d; \#^/etc/hotplug.d/iface/99-xrayop$#d; \#^/etc/xrayop/$#d; \#^/usr/bin/xrayopd$#d' \
+    sed -i '\#^/etc/init.d/xrayop$#d; \#^/etc/hotplug.d/iface/99-xrayop$#d; \#^/etc/xrayop/$#d; \#^/usr/bin/xrayopd$#d; \#^/usr/bin/xray$#d; \#^/usr/sbin/xray$#d; \#^/usr/bin/xray-core$#d' \
         /etc/sysupgrade.conf
     say "cleaned /etc/sysupgrade.conf"
 fi

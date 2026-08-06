@@ -316,6 +316,22 @@ per-user token that would yield the whole list, credentials included.
 
 ## Troubleshooting
 
+**Everything stopped after a firmware upgrade.**
+A sysupgrade wipes `/usr`. The installer lists its own files in `/etc/sysupgrade.conf`, so the daemon, your
+server list and your settings come back — but the *core* may not. If `xray` was installed as a package,
+attended sysupgrade rebuilds it into the new image; if it was placed by hand, nothing reinstalls it and you are
+left with a daemon and no core. Check with `ls -l /usr/bin/xray`, and if it is gone:
+
+```sh
+apk add xray-core && /etc/init.d/xray disable && /etc/init.d/xrayop restart
+```
+
+The `disable` matters: the package ships its own service, and a second core started by procd would fight the
+one `xrayopd` supervises. Installing from a package is worth preferring for exactly this reason — it survives
+the next upgrade on its own. The boot symlink is also lost, so if the service does not come up by itself, run
+`/etc/init.d/xrayop enable`. Nothing is broken meanwhile: with no core, no firewall rules are installed and the
+LAN keeps a direct connection.
+
 **The panel will not load.**
 Check the service is up: `ssh root@ROUTER_IP 'ps | grep xrayopd; logread | grep xrayop | tail -20'`.
 If you reach it by a name like `router.lan` you will get *"reach the panel by IP address, not by hostname"* —
