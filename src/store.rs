@@ -41,6 +41,8 @@ pub struct App {
     pub tproxy_applied: bool,
     /// Whether dnsmasq is currently forwarding the LAN's queries to Xray.
     pub dns_via_tunnel: bool,
+    /// Liveness counters kept by [`crate::health`].
+    pub health: crate::health::Status,
     /// Set while a latency sweep is running, so a user hammering "test all"
     /// cannot pin every worker thread at once.
     pub probing: Arc<AtomicBool>,
@@ -73,6 +75,15 @@ impl App {
             }
         };
 
+        let mut state = state;
+        // State written before `mode` existed carries only `transparent`.
+        if state.settings.mode.is_empty() {
+            state.settings.mode = if state.settings.transparent { "global" } else { "proxy" }.into();
+        }
+        // `mode` is what the user sets; `transparent` is what the rules read.
+        // Deriving one from the other here means there is only ever one answer.
+        state.settings.transparent = state.settings.mode == "global";
+
         let app = App {
             state,
             sup: Supervisor::new(Paths::new(runtime_dir)),
@@ -80,6 +91,7 @@ impl App {
             tproxy_deadline: 0,
             tproxy_applied: false,
             dns_via_tunnel: false,
+            health: crate::health::Status::default(),
             probing: Arc::new(AtomicBool::new(false)),
             state_path,
         };
@@ -123,6 +135,8 @@ impl App {
             server_ips,
             tunnel_ipv6: s.tunnel_ipv6,
             dns_redirect: s.dns_redirect,
+            route_router_traffic: s.route_router_traffic,
+            dns_bypass_resolver: s.dns_bypass_resolver.parse().ok(),
         }
     }
 

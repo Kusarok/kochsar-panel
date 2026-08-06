@@ -38,8 +38,13 @@ const PRIVATE_NETS: &[&str] = &[
 /// Returns `None` when no node is selected -- the caller should stop Xray
 /// rather than run it with an empty outbound list.
 pub fn build_config(state: &State) -> Option<Value> {
-    let node = state.find(&state.active)?;
     let s = &state.settings;
+    // "off" is a first-class state, not an absence of configuration: the core
+    // is stopped so that nothing this daemon does can affect connectivity.
+    if !s.core_enabled() {
+        return None;
+    }
+    let node = state.find(&state.active)?;
     let listen = if s.allow_lan { "0.0.0.0" } else { "127.0.0.1" };
 
     // `routeOnly` keeps the sniffed domain for routing decisions but leaves the

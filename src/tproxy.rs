@@ -108,6 +108,18 @@ pub struct Plan {
     /// Force every LAN DNS query to the router's resolver, so clients with a
     /// hardcoded public resolver cannot resolve outside the tunnel.
     pub dns_redirect: bool,
+    /// Also tunnel traffic the router itself originates: package updates, NTP,
+    /// LuCI's own requests.
+    ///
+    /// Off by default, and worth understanding before turning on: with it on, a
+    /// core that will not start takes the router's own connectivity with it, not
+    /// just the LAN's. [`crate::health`] unwinds the rules when that happens,
+    /// but the safest posture is to leave this off unless it is needed.
+    pub route_router_traffic: bool,
+    /// Resolver that answers the proxy servers' hostnames directly. Must be
+    /// bypassed, or tunnelling the router's own traffic recreates the
+    /// resolution deadlock from the other side.
+    pub dns_bypass_resolver: Option<std::net::IpAddr>,
 }
 
 impl Plan {
@@ -120,6 +132,16 @@ impl Plan {
                 .filter(|ip| ip.is_ipv6() == v6)
                 .map(|ip| ip.to_string()),
         );
+        // dnsmasq queries this one directly to resolve the servers' own
+        // hostnames. Tunnelling it would mean the answer needed the tunnel that
+        // needs the answer -- the same deadlock, entered from the output side.
+        if let Some(ip) = self.dns_bypass_resolver {
+            if ip.is_ipv6() == v6 {
+                v.push(ip.to_string());
+            }
+        }
+        v.sort();
+        v.dedup();
         v
     }
 }
@@ -180,6 +202,20 @@ pub fn build_ruleset(plan: &Plan) -> String {
         .map(|i| format!("\"{i}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    // Router-originated packets are marked in the output chain, routed to lo by
+    // the ip rule, and arrive back here with `iif lo`. They must be caught
+    // before the LAN-interface guard below, which would otherwise release them.
+    if plan.route_router_traffic {
+        out.push_str("\t\t# The router's own traffic, marked in output and sent back via lo.\n");
+        for proto in ["tcp", "udp"] {
+            out.push_str(&format!(
+                "\t\tiifname \"lo\" meta nfproto ipv4 meta l4proto {proto} counter meta mark set {mark} tproxy ip to :{} accept\n",
+                plan.port
+            ));
+        }
+        out.push_str("\t\tiifname \"lo\" counter return\n\n");
+    }
+
     out.push_str("\t\t# Only intercept what the LAN sent us.\n");
     out.push_str(&format!("\t\tiifname != {{ {ifaces} }} counter return\n\n"));
 
@@ -226,6 +262,45 @@ pub fn build_ruleset(plan: &Plan) -> String {
     out.push_str("\t\tcounter jump divert\n");
     out.push_str("\t\tmeta l4proto { tcp, udp } counter jump intercept\n");
     out.push_str("\t}\n\n");
+
+    // --- output: the router's own traffic ---
+    //
+    // A `route` hook, not `filter`: changing the mark here has to trigger a
+    // fresh routing lookup, which is what sends the packet to lo and back
+    // through prerouting where the tproxy rules live.
+    if plan.route_router_traffic {
+        out.push_str("	chain output {
+");
+        out.push_str("		type route hook output priority mangle - 1; policy accept;
+
+");
+        // Order mirrors the intercept chain, and each line is load-bearing.
+        out.push_str("		oifname \"lo\" counter return
+");
+        out.push_str(&format!("		meta mark {XRAY_MARK} counter return
+"));
+        out.push_str("		ct direction reply counter return
+");
+        out.push_str("		fib daddr type local counter return
+");
+        out.push_str("		ip daddr @bypass4 counter return
+");
+        out.push_str("		ip6 daddr @bypass6 counter return
+");
+        if plan.dns_redirect {
+            // dnsmasq's own upstream queries. They are already aimed at Xray on
+            // loopback or at the bypass resolver; either way, not through here.
+            out.push_str("		meta l4proto { tcp, udp } th dport 53 counter return
+");
+        }
+        out.push_str(&format!(
+            "		meta nfproto ipv4 meta l4proto {{ tcp, udp }} counter meta mark set {mark}
+"
+        ));
+        out.push_str("	}
+
+");
+    }
 
     // --- DNS redirect ---
     //
@@ -616,6 +691,8 @@ mod tests {
             server_ips: vec!["203.0.113.7".parse().unwrap()],
             tunnel_ipv6: false,
             dns_redirect: true,
+            route_router_traffic: false,
+            dns_bypass_resolver: "1.1.1.1".parse().ok(),
         }
     }
 
@@ -695,6 +772,50 @@ mod tests {
         let iface = chain.find("iifname !=").unwrap();
         let redir = chain.find("redirect to :53").unwrap();
         assert!(iface < local && local < redir);
+    }
+
+    /// The router's own traffic is a separate decision from the LAN's, and the
+    /// default must be the safe one: a core that will not start should cost the
+    /// LAN its tunnel, not the router its connectivity.
+    #[test]
+    fn router_traffic_is_left_alone_by_default() {
+        let r = build_ruleset(&plan());
+        assert!(!r.contains("chain output"), "no output hook unless asked");
+        assert!(!r.contains("iifname \"lo\""), "and nothing catches lo re-entry");
+    }
+
+    #[test]
+    fn router_traffic_can_be_tunnelled() {
+        let mut p = plan();
+        p.route_router_traffic = true;
+        let r = build_ruleset(&p);
+
+        // A `route` hook, so changing the mark triggers a fresh routing lookup.
+        assert!(r.contains("type route hook output priority mangle - 1"));
+        // Marked packets come back through prerouting on lo and must be caught
+        // before the LAN-interface guard releases them.
+        let lo = r.find("iifname \"lo\" meta nfproto ipv4").expect("lo rule");
+        let guard = r.find("iifname != ").expect("lan guard");
+        assert!(lo < guard, "the lo rules must precede the interface guard");
+
+        // Loopback and xray's own sockets must leave the output chain first,
+        // or the router talks to itself through the tunnel.
+        let chain = r.split("chain output").nth(1).unwrap();
+        let lo_out = chain.find("oifname \"lo\" counter return").unwrap();
+        let xray = chain.find("meta mark 255 counter return").unwrap();
+        let mark = chain.find("meta mark set").unwrap();
+        assert!(lo_out < mark && xray < mark);
+    }
+
+    /// dnsmasq queries this resolver directly to answer the servers own
+    /// hostnames. Tunnelling it recreates the resolution deadlock from the
+    /// output side.
+    #[test]
+    fn the_bypass_resolver_is_never_tunnelled() {
+        let mut p = plan();
+        p.route_router_traffic = true;
+        p.dns_bypass_resolver = "9.9.9.9".parse().ok();
+        assert!(build_ruleset(&p).contains("9.9.9.9"));
     }
 
     #[test]

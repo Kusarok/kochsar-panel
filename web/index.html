@@ -155,6 +155,24 @@ label{display:block; font-size:12px; color:var(--muted); margin-bottom:7px}
 }
 .sw.on::after{inset-inline-start:26px; background:var(--accent)}
 
+/* ---------- mode switch ---------- */
+.modes{display:flex; gap:8px; padding:6px; border-radius:16px; margin-bottom:16px;
+  box-shadow:inset 4px 4px 9px var(--sh-dark), inset -4px -4px 9px var(--sh-light)}
+.modes button{
+  flex:1; border:0; background:transparent; color:var(--muted); font:inherit; font-size:13px;
+  padding:10px 6px; border-radius:12px; cursor:pointer; transition:.18s;
+}
+.modes button.sel{
+  color:var(--accent); background:var(--bg); font-weight:600;
+  box-shadow:4px 4px 8px var(--sh-dark), -4px -4px 8px var(--sh-light);
+}
+.modes button small{display:block; font-size:10px; color:var(--muted); font-weight:400; margin-top:2px}
+.badge{
+  display:inline-block; font-size:11px; padding:4px 10px; border-radius:8px; margin-bottom:12px;
+}
+.badge.warn{background:rgba(232,179,57,.13); color:var(--warn)}
+.badge.bad{background:rgba(255,107,107,.11); color:var(--bad)}
+
 /* ---------- lists ---------- */
 .node{
   display:flex; align-items:center; gap:12px; padding:13px 15px; margin-bottom:11px;
@@ -255,6 +273,12 @@ pre.log{
 
   <!-- ================= HOME ================= -->
   <section id="view-home">
+    <div class="modes" id="modeSwitch">
+      <button data-mode="off"><span data-t="modeOff">Off</span><small data-t="modeOffHint"></small></button>
+      <button data-mode="proxy"><span data-t="modeProxy">Proxy</span><small data-t="modeProxyHint"></small></button>
+      <button data-mode="global"><span data-t="modeGlobal">Global</span><small data-t="modeGlobalHint"></small></button>
+    </div>
+    <div id="healthBadge"></div>
     <div class="power-wrap">
       <div class="power-well">
         <div class="power-ring" id="ring">
@@ -360,7 +384,12 @@ pre.log{
           </div>
         </div>
         <p class="note" data-t="tpNote"></p>
-        <div id="tpStatus" style="margin-bottom:14px"></div>
+        <div class="tog">
+          <div class="t"><span data-t="routerTraffic">Also tunnel the router's own traffic</span>
+            <small data-t="routerTrafficHint"></small></div>
+          <button class="sw" id="swRouterTraffic" role="switch"></button>
+        </div>
+        <div id="tpStatus" style="margin:14px 0"></div>
         <div class="row">
           <button class="btn pri" id="btnTpEnable" data-t="enable">Enable</button>
           <button class="btn dang" id="btnTpDisable" data-t="disable">Disable</button>
@@ -551,6 +580,18 @@ const I18N = {
     testing:"Connection test", customUrl:"Custom URL",
     testNote:"Servers are tested by making a real request through each one. Pick the destination you actually care about — a server can reach Google and still fail on Instagram.",
     testingNow:"Testing through {0}…",
+    modeOff:"Off", modeProxy:"Proxy", modeGlobal:"Global",
+    modeOffHint:"nothing runs", modeProxyHint:"per-device", modeGlobalHint:"whole LAN",
+    modeConfirmGlobal:"Global mode changes the router's firewall.
+
+You have 90 seconds afterwards to confirm the internet still works. If you do not, it rolls back on its own.
+
+Continue?",
+    routerTraffic:"Also tunnel the router's own traffic",
+    routerTrafficHint:"Package updates, time sync, the router's own requests. Leave off unless needed: if the core will not start, this costs the router its connectivity too, not just the LAN's.",
+    healthDegraded:"The core could not be kept running, so the rules were removed and the LAN is direct. It will restore itself when the core recovers.",
+    healthRestarts:"core restarted {0}×",
+    healthUnreachable:"the core is running but requests are not getting through",
     testSkipped:"{0} not tested (list too long)",
   },
   fa: {
@@ -605,6 +646,18 @@ const I18N = {
     testing:"تست اتصال", customUrl:"نشانی دلخواه",
     testNote:"هر سرور با یک درخواست واقعی از داخل خودش تست می‌شود. مقصدی را انتخاب کنید که واقعاً برایتان مهم است — یک سرور می‌تواند به گوگل برسد ولی روی اینستاگرام کار نکند.",
     testingNow:"در حال تست از طریق {0}…",
+    modeOff:"خاموش", modeProxy:"پراکسی", modeGlobal:"سراسری",
+    modeOffHint:"هیچ چیز اجرا نمی‌شود", modeProxyHint:"هر دستگاه جدا", modeGlobalHint:"کل شبکه",
+    modeConfirmGlobal:"حالت سراسری قواعد فایروال روتر را تغییر می‌دهد.
+
+پس از آن ۹۰ ثانیه فرصت دارید تأیید کنید اینترنت کار می‌کند. اگر تأیید نکنید، خودکار برمی‌گردد.
+
+ادامه می‌دهید؟",
+    routerTraffic:"ترافیک خود روتر هم از تونل",
+    routerTrafficHint:"آپدیت پکیج‌ها، همگام‌سازی ساعت، درخواست‌های خود روتر. تا لازم نشده خاموش بگذارید: اگر هسته بالا نیاید، این کار اینترنت خود روتر را هم می‌برد، نه فقط شبکه را.",
+    healthDegraded:"هسته پایدار نماند، پس قواعد برداشته شد و شبکه مستقیم است. با بازگشت هسته خودکار برمی‌گردد.",
+    healthRestarts:"هسته {0} بار ری‌استارت شد",
+    healthUnreachable:"هسته اجرا می‌شود ولی درخواست‌ها عبور نمی‌کنند",
     testSkipped:"{0} سرور تست نشد (لیست بلند است)",
   },
 };
@@ -732,7 +785,7 @@ function render() {
   if (st.last_error) banner.appendChild(el("div", "err", st.last_error));
 
   startUptime(on ? st.started_at : 0);
-  renderNodes(); renderSubs(); renderDns(); renderTargets(); renderTproxy(); renderSettings();
+  renderMode(); renderNodes(); renderSubs(); renderDns(); renderTargets(); renderTproxy(); renderSettings();
 }
 
 let uptimeTimer = null;
@@ -821,6 +874,21 @@ function renderDns() {
     grid.appendChild(b);
   }
   if (document.activeElement !== $("#dnsCustom")) $("#dnsCustom").value = state.settings.dns_custom || "";
+}
+
+function renderMode() {
+  const m = state.settings.mode || "proxy";
+  $$("#modeSwitch button").forEach(b => b.classList.toggle("sel", b.dataset.mode === m));
+
+  const box = $("#healthBadge");
+  box.replaceChildren();
+  const h = state.health || {};
+  if (h.degraded) box.appendChild(el("div", "badge bad", t("healthDegraded")));
+  else if (m === "global" && h.reachable === false && h.probe_failures > 1)
+    box.appendChild(el("div", "badge warn", t("healthUnreachable")));
+  else if (h.restarts > 0) box.appendChild(el("div", "badge warn", t("healthRestarts", h.restarts)));
+
+  $("#swRouterTraffic").className = "sw" + (state.settings.route_router_traffic ? " on" : "");
 }
 
 function renderTargets() {
@@ -933,6 +1001,17 @@ function setLang(next) {
 }
 $("#langBtn").onclick = () => setLang(lang === "fa" ? "en" : "fa");
 $("#langSel").onchange = (e) => setLang(e.target.value);
+
+$$("#modeSwitch button").forEach(b => {
+  b.onclick = () => {
+    const m = b.dataset.mode;
+    if (m === state.settings.mode && m !== "global") return;
+    if (m === "global" && !confirm(t("modeConfirmGlobal"))) return;
+    run(() => api("/api/mode", { mode: m }));
+  };
+});
+$("#swRouterTraffic").onclick = () =>
+  run(() => api("/api/settings", { route_router_traffic: !state.settings.route_router_traffic }));
 
 $("#pickServer").onclick = () => $$(".tabbar button")[1].click();
 

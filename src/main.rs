@@ -9,6 +9,7 @@
 //! * [`latency`] -- real-delay measurement through each server
 //! * [`dnscfg`] -- DNS presets
 //! * [`dnsmasq`] -- pointing the LAN resolver at Xray
+//! * [`health`]  -- keeping the core alive, and unwinding when it cannot be
 //! * [`xray`]   -- config generation and process supervision
 //! * [`store`]  -- application state and its operations
 //! * [`api`]    -- HTTP panel and JSON API
@@ -20,6 +21,7 @@
 mod api;
 mod dnscfg;
 mod dnsmasq;
+mod health;
 mod latency;
 mod model;
 mod net;
@@ -172,6 +174,7 @@ fn main() -> ExitCode {
 
     let app = Arc::new(Mutex::new(app));
     spawn_log_janitor(Arc::clone(&app));
+    health::spawn(Arc::clone(&app));
 
     if let Err(e) = api::serve(app, &args.listen, WORKERS) {
         eprintln!("xrayopd: {e}");
@@ -308,6 +311,8 @@ fn dump_ruleset(state_path: &std::path::Path, check: bool) -> Result<(), String>
         server_ips,
         tunnel_ipv6: s.tunnel_ipv6,
         dns_redirect: s.dns_redirect,
+        route_router_traffic: s.route_router_traffic,
+        dns_bypass_resolver: s.dns_bypass_resolver.parse().ok(),
     };
 
     print!("{}", tproxy::build_ruleset(&plan));

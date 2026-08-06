@@ -247,6 +247,18 @@ pub struct Settings {
     #[serde(default = "d_true")]
     pub sniff_route_only: bool,
 
+    // --- how traffic reaches the tunnel ---
+    /// `off` | `proxy` | `global`.
+    ///
+    /// The user-facing switch. `off` stops the core entirely, so a crash in
+    /// this daemon cannot take the router's connectivity with it. `proxy`
+    /// serves SOCKS/HTTP for clients that opt in. `global` intercepts the LAN.
+    ///
+    /// Empty means a state file written before this existed; [`crate::store`]
+    /// derives it from `transparent` on load.
+    #[serde(default)]
+    pub mode: String,
+
     // --- transparent proxy ---
     /// Intercept LAN traffic instead of requiring clients to set a proxy.
     /// Off by default: enabling it rewrites the router's packet path.
@@ -282,6 +294,13 @@ pub struct Settings {
     /// a server whose address it cannot resolve. See [`crate::dnsmasq::install`].
     #[serde(default = "d_bypass_resolver")]
     pub dns_bypass_resolver: String,
+    /// Also tunnel the router's own outbound traffic -- package updates, NTP,
+    /// LuCI's own requests. Passwall2 calls this `localhost_proxy`.
+    ///
+    /// Off by default. With it on, a core that will not start takes the
+    /// router's connectivity with it, not just the LAN's.
+    #[serde(default)]
+    pub route_router_traffic: bool,
     /// Redirect every LAN query to the router's resolver.
     ///
     /// On by default: a device with a hardcoded public resolver would otherwise
@@ -331,7 +350,15 @@ fn d_lan_interfaces() -> String {
     "br-lan".into()
 }
 
+/// The three ways traffic can reach the tunnel.
+pub const MODES: &[&str] = &["off", "proxy", "global"];
+
 impl Settings {
+    /// Whether the core should be running at all.
+    pub fn core_enabled(&self) -> bool {
+        self.mode != "off"
+    }
+
     /// LAN interfaces as a list, blanks removed.
     pub fn lan_list(&self) -> Vec<String> {
         self.lan_interfaces
@@ -365,6 +392,8 @@ impl Default for Settings {
             lan_interfaces: d_lan_interfaces(),
             tunnel_ipv6: false,
             dns_port: d_dns_port(),
+            mode: "proxy".into(),
+            route_router_traffic: false,
             dns_redirect: true,
             dns_bypass_resolver: d_bypass_resolver(),
             test_target: d_test_target(),

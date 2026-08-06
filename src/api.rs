@@ -127,6 +127,7 @@ fn dispatch(app: &Arc<Mutex<App>>, mut request: Request) {
                 "/api/tproxy/confirm" => handle_tproxy_confirm(app),
                 "/api/tproxy/disable" => handle_tproxy_disable(app),
                 "/api/nodes/restore" => handle_restore(app),
+                "/api/mode" => handle_mode(app, &body),
                 _ => error(404, "no such endpoint"),
             },
         },
@@ -146,6 +147,7 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
     // by the tproxy handlers, which are the only things that change it.
     let tproxy_applied = app.tproxy_applied;
     let dns_via_tunnel = app.dns_via_tunnel;
+    let health = app.health.clone();
     let state = &app.state;
 
     let nodes: Vec<Value> = state
@@ -201,6 +203,14 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
             "running_node": app.sup.running_node,
             "last_error": app.sup.last_error,
             "config_path": app.sup.config_path().display().to_string(),
+        },
+        "health": {
+            "restarts": health.restarts,
+            "failures": health.failures,
+            "degraded": health.degraded,
+            "reachable": health.reachable,
+            "probe_failures": health.probe_failures,
+            "last_failure": health.last_failure,
         },
         "tproxy": {
             "enabled": state.settings.transparent,
@@ -433,12 +443,61 @@ fn handle_dns(app: &Arc<Mutex<App>>, body: &Value) -> Body {
 
 fn handle_settings(app: &Arc<Mutex<App>>, body: &Value) -> Body {
     let current = lock(app).state.settings.clone();
-    let next = match apply_settings(current, body) {
+    let next = match apply_settings(current.clone(), body) {
         Ok(next) => next,
         Err(e) => return error(400, &e),
     };
+    // Several settings are baked into the nftables ruleset, not the Xray
+    // config, so `save_and_apply` alone would persist them and leave the kernel
+    // running the previous rules -- the panel would show one thing and the
+    // router would do another.
+    let rules_changed = next.route_router_traffic != current.route_router_traffic
+        || next.dns_redirect != current.dns_redirect
+        || next.tunnel_ipv6 != current.tunnel_ipv6
+        || next.lan_interfaces != current.lan_interfaces
+        || next.tproxy_port != current.tproxy_port
+        || next.dns_bypass_resolver != current.dns_bypass_resolver
+        || next.dns_port != current.dns_port;
+
     lock(app).state.settings = next;
-    finish_write(app, json!({ "ok": true }))
+    let response = finish_write(app, json!({ "ok": true }));
+
+    if rules_changed && lock(app).state.settings.transparent {
+        reapply_rules(app);
+    }
+    response
+}
+
+/// Rebuilds the firewall rules and the resolver hand-off in place.
+///
+/// No probation handshake here: transparent mode is already confirmed and
+/// working, and the change is a refinement of it rather than a leap. A failure
+/// leaves the previous rules removed, which [`crate::health`] will notice and
+/// unwind properly.
+fn reapply_rules(app: &Arc<Mutex<App>>) {
+    let host = lock(app).active_server_host();
+    let ips = host.map(|h| probe::resolve_all(&h)).unwrap_or_default();
+
+    let (plan, dns_port, bypass, resolver) = {
+        let a = lock(app);
+        (
+            a.tproxy_plan(ips),
+            a.state.settings.dns_port,
+            a.server_hostnames(),
+            a.state.settings.dns_bypass_resolver.clone(),
+        )
+    };
+    if let Err(e) = tproxy::apply(&plan) {
+        eprintln!("xrayop: settings changed but the rules would not re-apply: {e}");
+        lock(app).tproxy_applied = false;
+        return;
+    }
+    if let Err(e) = dnsmasq::install(dns_port, &bypass, &resolver) {
+        eprintln!("xrayop: settings changed but the resolver would not re-apply: {e}");
+    }
+    let mut a = lock(app);
+    a.tproxy_applied = true;
+    a.dns_via_tunnel = true;
 }
 
 /// Folds a settings patch onto `next`, validating as it goes.
@@ -562,6 +621,11 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
             next.test_url_custom = u.to_string();
         }
     }
+    if let Some(raw) = body.get("route_router_traffic") {
+        next.route_router_traffic = raw
+            .as_bool()
+            .ok_or("route_router_traffic must be true or false")?;
+    }
     if let Some(raw) = body.get("dns_bypass_resolver") {
         let v = raw.as_str().unwrap_or_default().trim();
         // Must be a plain address: this one is queried directly, outside the
@@ -608,6 +672,52 @@ fn handle_service(app: &Arc<Mutex<App>>, body: &Value) -> Body {
         }
         other => error(400, &format!("unknown action {other:?}")),
     }
+}
+
+/// Switches between off / proxy / global.
+///
+/// One endpoint rather than three settings, because the transitions are not
+/// symmetric: leaving `global` has to tear down firewall rules, and entering it
+/// has to go through the confirm-or-revert handshake. Expressing that as a
+/// boolean the user could set from the settings form would make it possible to
+/// half-apply it.
+fn handle_mode(app: &Arc<Mutex<App>>, body: &Value) -> Body {
+    let mode = str_field(body, "mode");
+    if !crate::model::MODES.contains(&mode.as_str()) {
+        return error(400, "mode must be off, proxy or global");
+    }
+    let current = lock(app).state.settings.mode.clone();
+    if mode == current && mode != "global" {
+        return json_ok(json!({ "ok": true, "mode": mode }));
+    }
+
+    // Always leave the intercepting state cleanly before entering the new one.
+    // Going proxy -> off -> proxy must not leave rules behind, and going
+    // global -> global has to start from a known ruleset rather than layering.
+    if current == "global" || lock(app).tproxy_applied {
+        rollback_tproxy(app);
+    }
+
+    {
+        let mut a = lock(app);
+        a.state.settings.mode = mode.clone();
+        a.state.settings.transparent = mode == "global";
+        // Reset the health counters: a mode change is a fresh start, and a
+        // "degraded" badge from the previous mode would be misleading.
+        a.health.degraded = false;
+        a.health.failures = 0;
+        a.health.last_failure.clear();
+    }
+
+    if mode == "global" {
+        // Reuses the probation handshake: apply, then confirm within the
+        // window or it rolls back on its own.
+        return handle_tproxy_enable(app);
+    }
+
+    // "off" stops the core because `build_config` returns nothing for it;
+    // "proxy" starts it with SOCKS and HTTP only.
+    finish_write(app, json!({ "mode": mode }))
 }
 
 // --- transparent proxy ---
