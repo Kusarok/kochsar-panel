@@ -27,6 +27,7 @@ use crate::tproxy;
 use crate::xray;
 use serde_json::{json, Value};
 use std::io::{Cursor, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -52,7 +53,21 @@ pub fn serve(app: Arc<Mutex<App>>, addr: &str, workers: usize) -> Result<(), Str
         let server = Arc::clone(&server);
         let app = Arc::clone(&app);
         handles.push(thread::spawn(move || loop {
-            let Ok(request) = server.recv() else { return };
+            let request = match server.recv() {
+                Ok(r) => r,
+                Err(e) => {
+                    // tiny_http's listener thread terminates on the first
+                    // accept error of any kind -- EMFILE, ECONNABORTED, all of
+                    // them. Returning here would leave the other workers
+                    // blocked on a queue with no producer: the process stays
+                    // alive, so procd never respawns it, and the panel is dead
+                    // until someone restarts it by hand. Exiting is blunt but
+                    // correct on a router, where procd rebuilds everything in
+                    // seconds.
+                    eprintln!("xrayop: cannot accept connections ({e}); exiting for a restart");
+                    std::process::exit(1);
+                }
+            };
             // A panic in one handler must not kill the worker and shrink the
             // pool; catch it and return a 500 instead.
             let url = request.url().to_string();
@@ -75,8 +90,19 @@ fn dispatch(app: &Arc<Mutex<App>>, mut request: Request) {
     // Strip any query string; no route uses one.
     let path = request.url().split('?').next().unwrap_or("/").to_string();
 
+    // The panel itself is a static file with no data in it, so it is served
+    // before the gate -- otherwise there would be nowhere to type the token.
+    if method == "GET" && (path == "/" || path == "/index.html") {
+        let _ = request.respond(html(INDEX_HTML));
+        return;
+    }
+
+    if let Err(denied) = gate(&request, app) {
+        let _ = request.respond(denied);
+        return;
+    }
+
     let response = match (method.as_str(), path.as_str()) {
-        ("GET", "/") | ("GET", "/index.html") => html(INDEX_HTML),
         ("GET", "/api/state") => handle_state(app),
         ("GET", "/api/log") => handle_log(app),
 
@@ -96,6 +122,7 @@ fn dispatch(app: &Arc<Mutex<App>>, mut request: Request) {
                 "/api/tproxy/enable" => handle_tproxy_enable(app),
                 "/api/tproxy/confirm" => handle_tproxy_confirm(app),
                 "/api/tproxy/disable" => handle_tproxy_disable(app),
+                "/api/nodes/restore" => handle_restore(app),
                 _ => error(404, "no such endpoint"),
             },
         },
@@ -110,6 +137,10 @@ fn dispatch(app: &Arc<Mutex<App>>, mut request: Request) {
 fn handle_state(app: &Arc<Mutex<App>>) -> Body {
     let mut app = lock(app);
     let running = app.sup.is_running();
+    // Deliberately NOT calling tproxy::is_applied() here: it forks `nft`, and
+    // the panel polls this route every 6 seconds. The cached value is refreshed
+    // by the tproxy handlers, which are the only things that change it.
+    let tproxy_applied = app.tproxy_applied;
     let state = &app.state;
 
     let nodes: Vec<Value> = state
@@ -131,9 +162,28 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
         })
         .collect();
 
+    // A subscription URL usually embeds a per-user token. Handing it back would
+    // undo the node list's credential redaction below: anyone holding the URL
+    // can fetch the full list -- UUIDs, REALITY keys and all -- straight from
+    // the provider.
+    let subs: Vec<Value> = state
+        .subs
+        .iter()
+        .map(|s| {
+            json!({
+                "id": s.id,
+                "name": s.name,
+                "host": sub_host(&s.url),
+                "last_update": s.last_update,
+                "node_count": s.node_count,
+                "last_error": s.last_error,
+            })
+        })
+        .collect();
+
     json_ok(json!({
         "nodes": nodes,
-        "subs": state.subs,
+        "subs": subs,
         "settings": state.settings,
         "active": state.active,
         "dns_presets": dnscfg::PRESETS,
@@ -147,9 +197,10 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
         },
         "tproxy": {
             "enabled": state.settings.transparent,
-            "applied": tproxy::is_applied(),
+            "applied": tproxy_applied,
             // Non-zero means a change is on probation and will roll back.
             "deadline": app.tproxy_deadline,
+            "armed": app.tproxy_guard.is_armed(),
             "now": xray::now_secs(),
             "port": state.settings.tproxy_port,
             "interfaces": state.settings.lan_list(),
@@ -267,6 +318,21 @@ fn handle_node_remove(app: &Arc<Mutex<App>>, body: &Value) -> Body {
     finish_write(app, json!({ "ok": true }))
 }
 
+/// Rolls the node list back to the previous saved generation.
+///
+/// The backup is written on every save that had nodes, so this undoes an
+/// accidental "delete all" without needing the subscription URLs again.
+fn handle_restore(app: &Arc<Mutex<App>>) -> Body {
+    let restored = {
+        let mut a = lock(app);
+        match a.restore_backup() {
+            Ok(n) => n,
+            Err(e) => return error(404, &e),
+        }
+    };
+    finish_write(app, json!({ "restored": restored }))
+}
+
 fn handle_select(app: &Arc<Mutex<App>>, body: &Value) -> Body {
     let id = str_field(body, "id");
     // "fastest" lets the panel offer one-click auto-selection.
@@ -285,10 +351,23 @@ fn handle_select(app: &Arc<Mutex<App>>, body: &Value) -> Body {
 }
 
 fn handle_test(app: &Arc<Mutex<App>>) -> Body {
-    let jobs = lock(app).probe_jobs();
+    let (jobs, gate) = {
+        let a = lock(app);
+        (a.probe_jobs(), Arc::clone(&a.probing))
+    };
     if jobs.is_empty() {
         return error(400, "there are no nodes to test");
     }
+
+    // One sweep at a time. A large list takes tens of seconds, and a user
+    // clicking a stalled button four times would otherwise pin all four worker
+    // threads and make the panel unresponsive until every sweep finished.
+    if gate.swap(true, Ordering::SeqCst) {
+        return error(409, "a latency test is already running");
+    }
+    // Released on every exit path below, including a panic in the sweep.
+    let _release = ReleaseOnDrop(Arc::clone(&gate));
+
     // Probing is seconds of network wait -- the lock must be released first.
     let results = probe::probe_many(jobs, PROBE_TIMEOUT);
 
@@ -364,6 +443,16 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
         if v.is_empty() {
             return Err("xray_bin must not be empty".into());
         }
+        // This path is executed as root. Confining it to the directories a
+        // package manager installs into turns "run anything on the box" into
+        // "choose between the xray builds that are actually installed".
+        const ALLOWED: &[&str] = &["/usr/bin/", "/usr/sbin/", "/bin/", "/sbin/", "/usr/libexec/"];
+        if !ALLOWED.iter().any(|p| v.starts_with(p)) || v.contains("..") {
+            return Err(format!(
+                "xray binary must live under one of {}",
+                ALLOWED.join(", ")
+            ));
+        }
         next.xray_bin = v.to_string();
     }
     if let Some(raw) = body.get("log_level") {
@@ -400,7 +489,44 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
         if v.is_empty() {
             return Err("at least one LAN interface is required".into());
         }
+        // This string is interpolated straight into an nftables script that is
+        // fed to `nft -f` as root. A quote, brace or newline here would escape
+        // the intended rule -- and since `disable` only deletes our own table,
+        // an injected second table would outlive it.
+        for name in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let ok = name.len() <= 15
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+            if !ok {
+                return Err(format!("{name:?} is not a valid interface name"));
+            }
+        }
         next.lan_interfaces = v.to_string();
+    }
+    if let Some(raw) = body.get("go_mem_limit_mb") {
+        let v = raw.as_u64().ok_or("go_mem_limit_mb must be a number")?;
+        if v != 0 && !(32..=512).contains(&v) {
+            return Err("Go memory limit must be 0 (off) or between 32 and 512 MB".into());
+        }
+        next.go_mem_limit_mb = v;
+    }
+    if let Some(raw) = body.get("mem_hard_cap_mb") {
+        let v = raw.as_u64().ok_or("mem_hard_cap_mb must be a number")?;
+        if v != 0 && !(64..=512).contains(&v) {
+            return Err("hard memory cap must be 0 (off) or between 64 and 512 MB".into());
+        }
+        next.mem_hard_cap_mb = v;
+    }
+    if let Some(raw) = body.get("conn_idle_secs") {
+        let v = raw.as_u64().ok_or("conn_idle_secs must be a number")?;
+        if !(30..=600).contains(&v) {
+            return Err("idle timeout must be between 30 and 600 seconds".into());
+        }
+        next.conn_idle_secs = v as u32;
+    }
+    if let Some(raw) = body.get("sniff_route_only") {
+        next.sniff_route_only = raw.as_bool().ok_or("sniff_route_only must be true or false")?;
     }
 
     if next.socks_port == next.http_port {
@@ -450,8 +576,14 @@ const CONFIRM_SECS: u64 = 90;
 /// packets are black-holed. The revert path does the opposite: stop redirecting
 /// first, then reconfigure Xray.
 fn handle_tproxy_enable(app: &Arc<Mutex<App>>) -> Body {
-    // Resolve before taking the lock -- this is a DNS round trip.
-    let server_ips = lock(app).active_server_ips();
+    // Take the hostname, drop the guard, *then* resolve. Holding the lock
+    // across getaddrinfo stalls every other route for up to musl's five-second
+    // resolver timeout, and flaky upstream DNS is the normal condition here.
+    let host = lock(app).active_server_host();
+    let Some(host) = host else {
+        return error(400, "select a node first");
+    };
+    let server_ips = probe::resolve_all(&host);
 
     {
         let a = lock(app);
@@ -503,6 +635,7 @@ fn handle_tproxy_enable(app: &Arc<Mutex<App>>) -> Body {
     let guard = {
         let mut a = lock(app);
         a.tproxy_deadline = deadline;
+        a.tproxy_applied = true;
         a.tproxy_guard.clone()
     };
     let app2 = Arc::clone(app);
@@ -536,7 +669,7 @@ fn handle_tproxy_confirm(app: &Arc<Mutex<App>>) -> Body {
 
 fn handle_tproxy_disable(app: &Arc<Mutex<App>>) -> Body {
     rollback_tproxy(app);
-    let mut a = lock(app);
+    let a = lock(app);
     match a.save() {
         Ok(()) => json_ok(json!({ "ok": true, "transparent": false })),
         Err(e) => error(500, &e),
@@ -549,20 +682,120 @@ fn handle_tproxy_disable(app: &Arc<Mutex<App>>) -> Body {
 /// the same order: stop redirecting before reconfiguring Xray, or the gap
 /// between the two black-holes traffic.
 fn rollback_tproxy(app: &Arc<Mutex<App>>) {
-    let (plan, _) = {
-        let a = lock(app);
-        (a.tproxy_plan(Vec::new()), ())
-    };
+    let plan = lock(app).tproxy_plan(Vec::new());
     tproxy::revert(&plan);
 
     let mut a = lock(app);
     a.tproxy_guard.disarm();
     a.tproxy_deadline = 0;
+    a.tproxy_applied = false;
     a.state.settings.transparent = false;
     let state = a.state.clone();
     if let Err(e) = a.sup.apply(&state) {
         eprintln!("xrayop: could not restart xray after rollback: {e}");
     }
+}
+
+/// Clears a busy flag however the scope is left, including on a panic.
+struct ReleaseOnDrop(Arc<AtomicBool>);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+// --- access control ---
+
+/// Guards every `/api/*` route. Three independent checks, each closing a
+/// different attack.
+///
+/// 1. **Host must be an IP literal or `localhost`.** DNS rebinding needs the
+///    victim's browser to reach us under a *hostname* the attacker controls;
+///    refusing hostnames outright removes the technique with no configuration
+///    to get wrong.
+/// 2. **Origin, when present, must match Host.** Blocks a cross-origin `fetch`
+///    from a page the user happens to have open.
+/// 3. **A shared token.** Without it, anyone who can open a TCP socket to this
+///    port controls a root daemon that can MITM the whole household.
+fn gate(request: &Request, app: &Arc<Mutex<App>>) -> Result<(), Body> {
+    let host = header_value(request, "Host").unwrap_or_default();
+    if !host_is_literal(&host) {
+        return Err(error(
+            421,
+            "reach the panel by IP address, not by hostname",
+        ));
+    }
+
+    if let Some(origin) = header_value(request, "Origin") {
+        // "null" is what a sandboxed iframe or a file:// page sends.
+        let ok = origin
+            .rsplit_once("//")
+            .map(|(_, h)| h.eq_ignore_ascii_case(&host))
+            .unwrap_or(false);
+        if !ok {
+            return Err(error(403, "cross-origin requests are not accepted"));
+        }
+    }
+
+    let expected = lock(app).state.panel_token.clone();
+    if expected.is_empty() {
+        // Refusing is the safe failure: an empty token would authenticate
+        // everyone. See `model::generate_token`.
+        return Err(error(503, "panel token is unset; check the system log"));
+    }
+    let offered = header_value(request, "X-Xrayop-Token")
+        .or_else(|| {
+            header_value(request, "Authorization")
+                .and_then(|v| v.strip_prefix("Bearer ").map(str::to_string))
+        })
+        .unwrap_or_default();
+
+    if !constant_time_eq(offered.as_bytes(), expected.as_bytes()) {
+        return Err(error(401, "invalid or missing panel token"));
+    }
+    Ok(())
+}
+
+/// Whether `host` is an IP literal (with optional port) or loopback.
+fn host_is_literal(host: &str) -> bool {
+    if host.is_empty() {
+        return false;
+    }
+    // [::1]:8088
+    let bare = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((h, _)) => h,
+            None => return false,
+        }
+    } else {
+        host.rsplit_once(':')
+            .map(|(h, p)| if p.chars().all(|c| c.is_ascii_digit()) { h } else { host })
+            .unwrap_or(host)
+    };
+    bare.eq_ignore_ascii_case("localhost") || bare.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// Compares without an early return on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// `name` is `&'static str` because tiny_http's `HeaderField::equiv` requires
+/// it; every call site passes a literal anyway.
+fn header_value(request: &Request, name: &'static str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
 }
 
 // --- shared helpers ---
@@ -588,6 +821,12 @@ fn finish_write(app: &Arc<Mutex<App>>, mut payload: Value) -> Body {
     json_ok(payload)
 }
 
+/// Host of a subscription URL, for display without leaking its token.
+fn sub_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    rest.split(['/', '?']).next().unwrap_or("").to_string()
+}
+
 fn summary_json(s: &SubSummary, failed_subs: usize) -> Value {
     json!({
         "imported": s.imported,
@@ -606,12 +845,20 @@ fn lock(app: &Arc<Mutex<App>>) -> std::sync::MutexGuard<'_, App> {
 }
 
 fn read_json(request: &mut Request) -> Result<Value, String> {
-    // Requiring JSON is what makes a cross-origin form POST impossible.
-    let is_json = request
-        .headers()
-        .iter()
-        .any(|h| h.field.equiv("Content-Type") && h.value.as_str().contains("application/json"));
-    if !is_json {
+    // Compare the *essence* -- type/subtype with parameters stripped -- not a
+    // substring. `text/plain;charset=application/json` contains the string
+    // "application/json" but its essence is text/plain, which browsers treat
+    // as a CORS-safelisted simple request and send with no preflight. A
+    // substring check therefore admits exactly the cross-origin POST it was
+    // written to block. Fastify shipped this same bug as GHSA-3fjj-p79j-c9hh.
+    let essence = header_value(request, "Content-Type")
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if essence != "application/json" {
         return Err("Content-Type must be application/json".into());
     }
 
@@ -767,6 +1014,123 @@ mod tests {
                 "{patch} should be rejected"
             );
         }
+    }
+
+    /// DNS rebinding needs the browser to reach us under a hostname the
+    /// attacker controls. Accepting only IP literals removes the technique.
+    #[test]
+    fn only_ip_literals_are_accepted_as_host() {
+        for ok in [
+            "192.168.1.1",
+            "192.168.1.1:8088",
+            "127.0.0.1:8088",
+            "localhost",
+            "localhost:8088",
+            "[::1]:8088",
+            "[fdf2:5757:44e3::1]:8088",
+        ] {
+            assert!(host_is_literal(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "router.lan",
+            "rebind.evil.com",
+            "rebind.evil.com:8088",
+            "",
+            "192.168.1.1.evil.com",
+        ] {
+            assert!(!host_is_literal(bad), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn token_comparison_is_length_safe() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// The bypass that made the old substring check useless: this value
+    /// contains "application/json" but its essence is text/plain, which
+    /// browsers send cross-origin with no preflight.
+    #[test]
+    fn content_type_essence_rejects_the_csrf_bypass() {
+        let essence = |v: &str| {
+            v.split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase()
+        };
+        assert_eq!(essence("application/json"), "application/json");
+        assert_eq!(essence("application/json; charset=utf-8"), "application/json");
+        assert_eq!(essence("  APPLICATION/JSON  "), "application/json");
+
+        for bypass in [
+            "text/plain;charset=application/json",
+            "multipart/form-data; boundary=application/json",
+            "text/plain",
+        ] {
+            assert_ne!(
+                essence(bypass),
+                "application/json",
+                "{bypass} must not pass as JSON"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_tokens_are_not_exposed() {
+        assert_eq!(sub_host("https://provider.example/sub/SECRET123"), "provider.example");
+        assert_eq!(sub_host("http://a.b:8080/x?t=SECRET"), "a.b:8080");
+        assert!(!sub_host("https://p.example/sub/SECRET123").contains("SECRET"));
+    }
+
+    #[test]
+    fn xray_bin_is_confined_to_system_paths() {
+        for bad in ["/tmp/evil", "/etc/xrayop/x", "/usr/bin/../../tmp/x", "relative"] {
+            assert!(
+                apply_settings(Default::default(), &json!({ "xray_bin": bad })).is_err(),
+                "{bad} should be rejected"
+            );
+        }
+        assert!(apply_settings(Default::default(), &json!({ "xray_bin": "/usr/bin/xray" })).is_ok());
+    }
+
+    /// This string is interpolated into a root nftables script.
+    #[test]
+    fn lan_interface_names_are_charset_checked() {
+        for bad in [
+            "br-lan\" }\naccept\ntable inet backdoor {",
+            "br lan",
+            "br-lan; rm -rf /",
+            "verylonginterfacename",
+        ] {
+            assert!(
+                apply_settings(Default::default(), &json!({ "lan_interfaces": bad })).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+        assert!(
+            apply_settings(Default::default(), &json!({ "lan_interfaces": "br-lan, br-guest" }))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn resource_settings_are_range_checked() {
+        for bad in [
+            json!({ "conn_idle_secs": 5 }),
+            json!({ "conn_idle_secs": 9999 }),
+            json!({ "go_mem_limit_mb": 8 }),
+            json!({ "mem_hard_cap_mb": 4096 }),
+        ] {
+            assert!(apply_settings(Default::default(), &bad).is_err(), "{bad} allowed");
+        }
+        // 0 means "off" for both memory caps and must stay allowed.
+        assert!(apply_settings(Default::default(), &json!({ "go_mem_limit_mb": 0 })).is_ok());
+        assert!(apply_settings(Default::default(), &json!({ "mem_hard_cap_mb": 0 })).is_ok());
     }
 
     #[test]

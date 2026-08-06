@@ -83,6 +83,27 @@ fn main() -> ExitCode {
         eprintln!("xrayopd: {w}");
     }
 
+    // First run: mint the panel token and tell the user where to find it. It is
+    // printed to the log rather than shown in the panel, because anyone who can
+    // load the panel is exactly who we are trying to authenticate.
+    if app.state.panel_token.is_empty() {
+        app.state.panel_token = model::generate_token();
+        if app.state.panel_token.is_empty() {
+            eprintln!("xrayopd: cannot read /dev/urandom; refusing to run without a token");
+            return ExitCode::FAILURE;
+        }
+        if let Err(e) = app.save() {
+            eprintln!("xrayopd: cannot persist the panel token: {e}");
+            return ExitCode::FAILURE;
+        }
+        println!(
+            "xrayopd: panel token generated. Open the panel and enter:\n    {}\n\
+             (also readable with: sed -n 's/.*\"panel_token\": \"\\([^\"]*\\)\".*/\\1/p' {})",
+            app.state.panel_token,
+            args.state.display()
+        );
+    }
+
     // Restore the previous session. A failure here is reported but not fatal --
     // the panel is how the user would fix a bad node or a missing binary, so it
     // must come up either way.
@@ -93,17 +114,35 @@ fn main() -> ExitCode {
         }
     }
 
-    // nftables rules do not survive a reboot, so a confirmed transparent-proxy
-    // setup has to be laid down again here. No watchdog this time: these rules
-    // were already confirmed by a human, and at boot there is no browser to
-    // confirm them again.
+    // Reconcile the kernel with what we believe. nftables rules outlive the
+    // process, so both directions matter.
     if app.state.settings.transparent {
-        let plan = app.tproxy_plan(app.active_server_ips());
-        if let Err(e) = tproxy::apply(&plan) {
-            eprintln!("xrayopd: could not restore transparent proxy: {e}");
-            // Leave the setting on so the panel shows enabled-but-not-applied
-            // rather than silently pretending the tunnel is intercepting.
+        // Rules do not survive a reboot; lay them down again. No watchdog this
+        // time -- these were already confirmed by a human, and at boot there is
+        // no browser to confirm them again.
+        let ips = app
+            .active_server_host()
+            .map(|h| probe::resolve_all(&h))
+            .unwrap_or_default();
+        let plan = app.tproxy_plan(ips);
+        match tproxy::apply(&plan) {
+            Ok(()) => app.tproxy_applied = true,
+            Err(e) => {
+                // Leave the setting on so the panel shows enabled-but-not-applied
+                // rather than silently pretending the tunnel is intercepting.
+                eprintln!("xrayopd: could not restore transparent proxy: {e}");
+            }
         }
+    } else if tproxy::is_applied() {
+        // Rules exist that we did not sanction. This is what a crash during the
+        // confirmation window leaves behind: the setting was deliberately never
+        // saved, but the kernel kept the ruleset, so every LAN packet is being
+        // redirected to a port nothing is listening on. Without this branch the
+        // LAN stays black-holed across restarts, and a restart makes it worse
+        // rather than better -- the watchdog that was supposed to clean up died
+        // with the previous process.
+        eprintln!("xrayopd: found transparent-proxy rules from a previous run; removing them");
+        tproxy::revert(&app.tproxy_plan(Vec::new()));
     }
 
     println!(

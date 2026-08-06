@@ -211,6 +211,42 @@ pub struct Settings {
     #[serde(default = "d_log_rotate_secs")]
     pub log_rotate_secs: u64,
 
+    // --- resource containment ---
+    //
+    // Defaults here come from documented router failures, not guesswork; see
+    // the citations on each field.
+    /// Soft ceiling for Xray's Go heap, in MiB. 0 disables it.
+    ///
+    /// A soft limit makes Go collect harder as it approaches, trading CPU for
+    /// memory; it never fails an allocation. 70 MiB is the lowest value
+    /// reported working for a client config on a 512MB router
+    /// (XTLS/Xray-core#3221), so this leaves headroom above that.
+    #[serde(default = "d_go_mem_limit")]
+    pub go_mem_limit_mb: u64,
+    /// Hard address-space ceiling for Xray, in MiB. 0 disables it.
+    ///
+    /// Off by default: it is a backstop for a genuine runaway, and set too low
+    /// it kills a healthy core.
+    #[serde(default)]
+    pub mem_hard_cap_mb: u64,
+    /// Seconds an idle connection is held before Xray reclaims it.
+    ///
+    /// This is the single most important knob on a transparent-proxy router.
+    /// TPROXY UDP has no close signal, so Xray keeps one socket per 4-tuple
+    /// until this expires; at the stock 300s a torrent client outruns
+    /// reclamation and the router dies of socket exhaustion or OOM
+    /// (XTLS/Xray-core#5263, #4586, #4194 — maintainer-diagnosed).
+    #[serde(default = "d_conn_idle")]
+    pub conn_idle_secs: u32,
+    /// Use sniffed domains for routing only, leaving the destination address
+    /// alone.
+    ///
+    /// Overriding the destination breaks Tor, Apple push, and several IoT
+    /// devices (Xray inbound docs). Passwall2 ships route-only for the same
+    /// reason, and so do we.
+    #[serde(default = "d_true")]
+    pub sniff_route_only: bool,
+
     // --- transparent proxy ---
     /// Intercept LAN traffic instead of requiring clients to set a proxy.
     /// Off by default: enabling it rewrites the router's packet path.
@@ -238,6 +274,17 @@ fn d_log_max_kb() -> u64 {
 }
 fn d_log_rotate_secs() -> u64 {
     120
+}
+fn d_go_mem_limit() -> u64 {
+    96
+}
+/// Well below Xray's 300s default, which is what lets UDP sockets pile up
+/// faster than they are reclaimed. Maintainers suggested testing as low as 30.
+fn d_conn_idle() -> u32 {
+    120
+}
+fn d_true() -> bool {
+    true
 }
 fn d_lan_interfaces() -> String {
     "br-lan".into()
@@ -268,6 +315,10 @@ impl Default for Settings {
             log_enabled: false,
             log_max_kb: d_log_max_kb(),
             log_rotate_secs: d_log_rotate_secs(),
+            go_mem_limit_mb: d_go_mem_limit(),
+            mem_hard_cap_mb: 0,
+            conn_idle_secs: d_conn_idle(),
+            sniff_route_only: true,
             transparent: false,
             tproxy_port: d_tproxy_port(),
             lan_interfaces: d_lan_interfaces(),
@@ -288,6 +339,27 @@ pub struct State {
     /// Id of the selected node; empty when nothing is selected.
     #[serde(default)]
     pub active: String,
+    /// Shared secret for the panel, generated on first run.
+    ///
+    /// Lives on [`State`] rather than [`Settings`] so it cannot be returned by
+    /// `/api/state`, which serialises settings wholesale.
+    #[serde(default)]
+    pub panel_token: String,
+}
+
+/// Generates a panel token from the kernel's entropy pool.
+///
+/// Falls back to nothing on failure rather than to a weak value: an empty
+/// token makes the daemon refuse to serve, which is a visible failure instead
+/// of a guessable secret.
+pub fn generate_token() -> String {
+    let mut buf = [0u8; 16];
+    match std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut buf))
+    {
+        Ok(()) => buf.iter().map(|b| format!("{b:02x}")).collect(),
+        Err(_) => String::new(),
+    }
 }
 
 impl State {

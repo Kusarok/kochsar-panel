@@ -36,10 +36,10 @@
 
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Our nftables table. Separate from `fw4`, so a firewall reload cannot clobber
 /// it -- and so `nft delete table` is a complete, precise revert.
@@ -52,10 +52,17 @@ pub const PACKET_MARK: u32 = 0x1ee;
 /// the two cannot silently disagree if they ever run side by side.
 pub const XRAY_MARK: u32 = 255;
 /// Routing table holding the `local default dev lo` entry.
-pub const ROUTE_TABLE: u32 = 999;
+///
+/// Deliberately NOT 999. Passwall2 uses table 999, and `revert` flushes this
+/// table -- which runs at the start of every `apply` and from the watchdog. On
+/// a router where both are installed (the expected state during migration)
+/// sharing the number would delete Passwall2's local route while its nft rules
+/// still marked packets, black-holing a working tunnel instantly.
+pub const ROUTE_TABLE: u32 = 494;
 /// Explicit `ip rule` priority. Without one the kernel picks a slot just below
-/// the main table, and the ordering relative to other rules becomes luck.
-pub const RULE_PRIORITY: u32 = 999;
+/// the main table and the ordering relative to other rules becomes luck.
+/// Below Passwall2's 999 so ours is consulted first when both exist.
+pub const RULE_PRIORITY: u32 = 494;
 
 /// Destinations that must never be tunnelled.
 ///
@@ -71,6 +78,18 @@ const BYPASS4: &[&str] = &[
     "192.168.0.0/16",
     "224.0.0.0/4",
     "240.0.0.0/4",
+    // Special-purpose ranges the mature rulesets all carry. Tunnelling them is
+    // pointless today; 198.18.0.0/15 matters the day FakeDNS is added, since
+    // that is the conventional pool for synthetic addresses.
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "192.31.196.0/24",
+    "192.52.193.0/24",
+    "192.88.99.0/24",
+    "192.175.48.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
 ];
 
 const BYPASS6: &[&str] = &["::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
@@ -134,11 +153,19 @@ pub fn build_ruleset(plan: &Plan) -> String {
     out.push_str("\t\t# Replies belong to a flow xray already owns.\n");
     out.push_str("\t\tct direction reply counter return\n\n");
 
-    out.push_str("\t\t# Xray's own outbound. Without this, every packet recurses.\n");
+    // Kept as an explicit statement of intent, though it cannot match here:
+    // Xray's socket mark only exists on router-originated packets, which
+    // traverse `output`, not `prerouting`. The real guard against recursion is
+    // structural -- this chain never sees the router's own traffic at all.
+    // Passwall2 places the equivalent rule only in its OUTPUT chains.
+    out.push_str("\t\t# Xray's own outbound, should output interception ever be added.\n");
     out.push_str(&format!("\t\tmeta mark {XRAY_MARK} counter return\n\n"));
 
+    // Covers the LAN IP, the WAN IP and loopback, and keeps covering them
+    // after a WAN re-DHCP -- stronger than a static set of addresses, which
+    // has to be refreshed on every interface event.
     out.push_str("\t\t# Anything addressed to this router: SSH, LuCI, the panel, DNS.\n");
-    out.push_str("\t\tfib daddr type local counter return\n\n");
+    out.push_str("\t\tfib daddr type { local, broadcast, anycast, multicast } counter return\n\n");
 
     out.push_str("\t\t# Loopback, LAN, multicast, and the proxy server itself.\n");
     out.push_str("\t\tip daddr @bypass4 counter return\n");
@@ -185,6 +212,22 @@ pub fn build_ruleset(plan: &Plan) -> String {
     out.push_str("\t\ttype filter hook prerouting priority mangle - 1; policy accept;\n");
     out.push_str("\t\tcounter jump divert\n");
     out.push_str("\t\tmeta l4proto { tcp, udp } counter jump intercept\n");
+    out.push_str("\t}\n\n");
+
+    // --- input guard ---
+    //
+    // Xray's TPROXY inbound binds 0.0.0.0, so a LAN client can dial it
+    // directly. `followRedirect` then reads the original destination as the
+    // router's own address on this very port, routing sends it to `direct`,
+    // and Xray connects to itself -- once per iteration, until the router runs
+    // out of file descriptors. TPROXY-delivered packets keep their real
+    // destination port (443, 53, ...), so only genuine direct hits match here.
+    out.push_str("\tchain input_guard {\n");
+    out.push_str("\t\ttype filter hook input priority filter - 1; policy accept;\n");
+    out.push_str(&format!(
+        "\t\tiifname != \"lo\" meta l4proto {{ tcp, udp }} th dport {} ct state new counter reject\n",
+        plan.port
+    ));
     out.push_str("\t}\n}\n");
 
     out
@@ -201,6 +244,9 @@ fn set_block(name: &str, kind: &str, elements: &[String]) -> String {
 
 /// The `ip rule` / `ip route` entries that deliver marked packets to the local
 /// TPROXY socket instead of forwarding them.
+/// `route replace` rather than `route add`: if an earlier revert was
+/// interrupted the route may still exist, and `add` would fail with EEXIST and
+/// abort the whole apply.
 fn route_args(plan: &Plan) -> Vec<Vec<String>> {
     let a = |s: String| s.split(' ').map(String::from).collect::<Vec<_>>();
     let mut cmds = vec![
@@ -208,16 +254,38 @@ fn route_args(plan: &Plan) -> Vec<Vec<String>> {
             "-4 rule add fwmark {PACKET_MARK} table {ROUTE_TABLE} priority {RULE_PRIORITY}"
         )),
         a(format!(
-            "-4 route add local 0.0.0.0/0 dev lo table {ROUTE_TABLE}"
+            "-4 route replace local 0.0.0.0/0 dev lo table {ROUTE_TABLE}"
         )),
     ];
     if plan.tunnel_ipv6 {
         cmds.push(a(format!(
             "-6 rule add fwmark {PACKET_MARK} table {ROUTE_TABLE} priority {RULE_PRIORITY}"
         )));
-        cmds.push(a(format!("-6 route add local ::/0 dev lo table {ROUTE_TABLE}")));
+        cmds.push(a(format!(
+            "-6 route replace local ::/0 dev lo table {ROUTE_TABLE}"
+        )));
     }
     cmds
+}
+
+/// Whether Passwall2's nftables table is currently loaded.
+///
+/// Both projects register a base chain at `prerouting mangle - 1` and both
+/// install a `local default dev lo` route. Which tproxy fires first then
+/// depends on kernel registration order, and each one's divert chain re-marks
+/// the other's flows. That is not a supportable state, so we refuse to apply
+/// rather than produce an outage nobody can diagnose.
+pub fn passwall2_active() -> bool {
+    run(
+        "nft",
+        &[
+            "list".into(),
+            "table".into(),
+            "inet".into(),
+            "passwall2".into(),
+        ],
+    )
+    .is_ok()
 }
 
 /// Validates the ruleset against the running kernel without applying it.
@@ -235,6 +303,18 @@ pub fn check(plan: &Plan) -> Result<(), String> {
 /// Reverts on any failure, so a partial apply can never leave the router
 /// marking packets with no route to carry them.
 pub fn apply(plan: &Plan) -> Result<(), String> {
+    if plan.lan_interfaces.is_empty() {
+        // Would render `iifname != {  }`, which nft rejects with a confusing
+        // parse error rather than saying what is actually wrong.
+        return Err("no LAN interface configured".into());
+    }
+    if passwall2_active() {
+        return Err(
+            "Passwall2 is running and also manages transparent proxying. \
+             Stop it first: /etc/init.d/passwall2 stop"
+                .into(),
+        );
+    }
     check(plan).map_err(|e| format!("ruleset rejected: {e}"))?;
 
     // Start clean; applying twice must not stack duplicate rules.
@@ -280,12 +360,21 @@ pub fn revert(_plan: &Plan) {
                 break;
             }
         }
+        // Delete precisely the route we added. `route flush table N` would
+        // remove every route in the table regardless of owner -- which is how
+        // an earlier version of this file would have wiped Passwall2's routing
+        // when the two shared a table number.
+        let default = if family == "-4" { "0.0.0.0/0" } else { "::/0" };
         let _ = run(
             "ip",
             &[
                 family.into(),
                 "route".into(),
-                "flush".into(),
+                "del".into(),
+                "local".into(),
+                default.into(),
+                "dev".into(),
+                "lo".into(),
                 "table".into(),
                 ROUTE_TABLE.to_string(),
             ],
@@ -349,11 +438,28 @@ fn run(program: &str, args: &[String]) -> Result<(), String> {
 /// The panel arms this before applying and disarms it once the browser has
 /// round-tripped a confirmation. If the new ruleset breaks connectivity, that
 /// confirmation never arrives and the router heals itself.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Watchdog {
     /// Bumped on every arm and disarm. A timer whose generation is stale does
     /// nothing, which makes re-arming and cancelling the same operation.
     generation: Arc<AtomicU64>,
+    /// True while a timer is pending. Tracked separately rather than inferred
+    /// from the generation's parity, which was wrong for arm-then-arm.
+    armed: Arc<AtomicBool>,
+    /// Lets `disarm` wake a sleeping timer instead of leaving it to sleep out
+    /// its full duration. Without this, repeatedly enabling and disabling
+    /// leaves a thread parked for 90 seconds behind each click.
+    wake: Arc<(Mutex<u64>, Condvar)>,
+}
+
+impl Default for Watchdog {
+    fn default() -> Self {
+        Self {
+            generation: Arc::new(AtomicU64::new(0)),
+            armed: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new((Mutex::new(0), Condvar::new())),
+        }
+    }
 }
 
 impl Watchdog {
@@ -367,10 +473,36 @@ impl Watchdog {
         F: FnOnce() + Send + 'static,
     {
         let mine = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.armed.store(true, Ordering::SeqCst);
+
         let generation = Arc::clone(&self.generation);
+        let armed = Arc::clone(&self.armed);
+        let wake = Arc::clone(&self.wake);
+
         thread::spawn(move || {
-            thread::sleep(after);
+            let (lock, cv) = &*wake;
+            let deadline = Instant::now() + after;
+            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                // Superseded or cancelled: nothing to do.
+                if generation.load(Ordering::SeqCst) != mine {
+                    return;
+                }
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                if remaining.is_zero() {
+                    break;
+                }
+                let (g, _) = cv
+                    .wait_timeout(guard, remaining)
+                    .unwrap_or_else(|e| e.into_inner());
+                guard = g;
+            }
+            drop(guard);
+
             if generation.load(Ordering::SeqCst) == mine {
+                armed.store(false, Ordering::SeqCst);
                 on_timeout();
             }
         });
@@ -378,12 +510,16 @@ impl Watchdog {
 
     pub fn disarm(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        self.armed.store(false, Ordering::SeqCst);
+        let (lock, cv) = &*self.wake;
+        let mut n = lock.lock().unwrap_or_else(|e| e.into_inner());
+        *n += 1;
+        cv.notify_all();
     }
 
     /// Whether a timer is currently pending.
     pub fn is_armed(&self) -> bool {
-        // Arming makes the counter odd, disarming makes it even.
-        self.generation.load(Ordering::SeqCst) % 2 == 1
+        self.armed.load(Ordering::SeqCst)
     }
 }
 
@@ -432,12 +568,60 @@ mod tests {
         for guard in [
             "ct direction reply counter return",
             "meta mark 255 counter return",
-            "fib daddr type local counter return",
+            "fib daddr type { local, broadcast, anycast, multicast } counter return",
             "ip daddr @bypass4 counter return",
             "iifname != ",
         ] {
             assert!(index_of(&r, guard) < tproxy, "{guard} must come before tproxy");
         }
+    }
+
+    /// Xray's TPROXY inbound binds 0.0.0.0, so without this a LAN client can
+    /// dial it directly and make Xray connect to itself in a loop.
+    #[test]
+    fn direct_hits_on_the_tproxy_port_are_rejected() {
+        let r = build_ruleset(&plan());
+        assert!(r.contains("chain input_guard"));
+        assert!(r.contains("th dport 12345 ct state new counter reject"));
+        assert!(
+            r.contains("iifname != \"lo\""),
+            "loopback must stay allowed or xray cannot reach itself"
+        );
+    }
+
+    #[test]
+    fn special_purpose_ranges_are_bypassed() {
+        let r = build_ruleset(&plan());
+        // 198.18.0.0/15 is the conventional FakeDNS pool; the rest are
+        // documentation and benchmarking ranges nothing should tunnel.
+        for net in ["198.18.0.0/15", "192.0.2.0/24", "203.0.113.0/24", "192.88.99.0/24"] {
+            assert!(r.contains(net), "{net} must be bypassed");
+        }
+    }
+
+    /// Sharing a routing table with Passwall2 and then flushing it is how an
+    /// earlier version of this file would have taken down a working tunnel.
+    #[test]
+    fn routing_does_not_collide_with_passwall2() {
+        assert_ne!(ROUTE_TABLE, 999, "999 is Passwall2's table");
+        assert_ne!(RULE_PRIORITY, 999, "999 is Passwall2's rule priority");
+    }
+
+    #[test]
+    fn routes_are_added_idempotently() {
+        let rule = route_args(&plan())[1].join(" ");
+        assert!(
+            rule.contains("route replace"),
+            "an interrupted revert leaves the route behind; `add` would then fail with EEXIST"
+        );
+    }
+
+    #[test]
+    fn empty_interface_list_is_rejected_before_nft_sees_it() {
+        let mut p = plan();
+        p.lan_interfaces.clear();
+        let err = apply(&p).unwrap_err();
+        assert!(err.contains("LAN interface"), "got: {err}");
     }
 
     /// Reply packets must leave before anything else looks at them.
@@ -497,7 +681,7 @@ mod tests {
     #[test]
     fn traffic_to_the_router_itself_is_never_intercepted() {
         assert!(
-            build_ruleset(&plan()).contains("fib daddr type local"),
+            build_ruleset(&plan()).contains("fib daddr type { local, broadcast, anycast, multicast }"),
             "without this, SSH and the panel go through the tunnel"
         );
     }

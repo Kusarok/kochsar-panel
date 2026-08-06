@@ -45,10 +45,71 @@ cycle, and the UI is whatever we want it to be rather than whatever CBI renders.
   traffic is not intercepted.
 - VLESS only. VMess, Trojan, Shadowsocks and Hysteria links are counted as
   "unsupported" on import rather than parsed.
-- **No authentication on the panel.** Anyone who can reach the port can drive
-  it. Keep it on a trusted LAN.
-- Latency is a TCP handshake, not end-to-end proxy delay. A reachable server can
-  still fail to authenticate.
+- Latency is a TCP handshake, not end-to-end proxy delay.
+A reachable server can still fail to authenticate.
+
+---
+
+## Access control
+
+The panel is served on the LAN by a daemon running as root that can rewrite the
+router's firewall, so it is gated three independent ways. Each closes a
+different attack, and none of them is a substitute for the others.
+
+**A token.** Generated from `/dev/urandom` on first run, printed to the system
+log, stored in `state.json` (mode `0600`). Every `/api/*` route requires it in
+`X-Xrayop-Token` or as a bearer token; comparison is constant-time. Read it with:
+
+```bash
+logread | grep -A2 'panel token'
+```
+
+**Host must be an IP literal or `localhost`.** DNS rebinding works by making the
+victim's browser reach the panel under a *hostname* the attacker controls.
+Refusing hostnames outright removes the technique, with nothing to configure.
+
+**Content-Type essence, not substring.** A mutating request must arrive as
+`application/json` — compared after stripping parameters. An earlier version
+checked whether the header *contained* `application/json`, which
+`text/plain;charset=application/json` satisfies while browsers still treat it as
+a CORS-safelisted simple request and send it cross-origin with no preflight.
+That is the same bug Fastify shipped as GHSA-3fjj-p79j-c9hh. `Origin`, when
+present, must also match `Host`.
+
+Beyond the gate: subscription URLs are never returned by the API (they usually
+embed a per-user token that would yield the full node list, credentials
+included); `xray_bin` is confined to system directories because it is executed
+as root; LAN interface names are charset-checked before being interpolated into
+an `nft -f` script; and the subscription fetcher refuses loopback and
+link-local addresses so it cannot be used to reach the router's own admin pages.
+
+## Resource containment
+
+An OpenWrt router has no swap and no room for a slow leak. These defaults come
+from documented failures in Xray's issue tracker and from what the mature
+OpenWrt proxy apps actually ship, not from guesswork.
+
+| Setting | Default | Why |
+|---|---|---|
+| `connIdle` | 120 s | TPROXY UDP carries no close signal, so Xray holds one socket per 4-tuple until this expires. At the stock 300 s a torrent client creates sockets faster than they are reclaimed — the most-reported router failure in Xray's tracker, maintainer-diagnosed. |
+| `nofile` | 65536 | The same failure seen from the other side. Passwall2 sets no limit at all, so Xray inherits the kernel's 1024 and users hit `accept4: too many open files`. |
+| `GOMEMLIMIT` | 96 MiB | Soft ceiling: Go collects harder as it approaches and never fails an allocation. 70 MiB is the lowest value reported working for a client config on a 512 MB router. |
+| `RLIMIT_DATA` | off | Hard backstop for a genuine runaway, so Xray dies instead of the OOM killer picking dnsmasq. Off by default because set too low it kills a healthy core. |
+| access log | `none` | Separate from `loglevel`: without this Xray writes a line per connection at *every* level. On a busy LAN it is the largest log producer by far. |
+| `routeOnly` | true | Sniffed domains are used for routing but the destination is left alone. Overriding it breaks Tor, Apple push and several IoT devices. |
+| log file | none | Off by default; the log lives on tmpfs, which is RAM. When on, a janitor truncates it on a size cap and an age cap. |
+
+Two pieces of widely-repeated advice are deliberately **not** followed:
+`V2RAY_CONF_GEOLOADER=memconservative` does nothing on Xray (it is a v2fly
+variable), and `bufferSize` is left unset because 32-bit ARM already defaults to
+no internal buffer and the value `0` now means *unlimited* rather than
+*disabled*.
+
+Before restarting, a candidate config is written to a staging file and validated
+with `xray run -test`. A rejected config leaves the running tunnel untouched.
+The staging file keeps a `.json` extension — Xray infers the config format from
+the file name, and a name like `config.json.next` fails with "Failed to get
+format" no matter what is inside it.
 
 ---
 

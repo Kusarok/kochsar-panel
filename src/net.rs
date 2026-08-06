@@ -30,6 +30,20 @@ pub fn fetch(url: &str, timeout_secs: u32) -> Result<String, String> {
     if url.starts_with('-') {
         return Err("invalid subscription URL".into());
     }
+    // This runs as root from inside the LAN, so an unrestricted fetcher is an
+    // SSRF primitive: it can reach the router's own admin interfaces and any
+    // LAN host. Loopback and link-local are never legitimate subscription
+    // hosts, so they are refused outright. Other private ranges are allowed
+    // because self-hosting a subscription on the LAN is a real thing people do.
+    if let Some(host) = host_of(url) {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            if ip.is_loopback() || is_link_local(&ip) || ip.is_unspecified() {
+                return Err("subscription URL may not point at the router itself".into());
+            }
+        } else if host.eq_ignore_ascii_case("localhost") {
+            return Err("subscription URL may not point at the router itself".into());
+        }
+    }
 
     let output = Command::new("curl")
         .args([
@@ -76,9 +90,60 @@ pub fn fetch(url: &str, timeout_secs: u32) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Host portion of a URL, without userinfo, port, or brackets.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url.split_once("://")?.1;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    // Strip any user:pass@ prefix.
+    let authority = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    if let Some(v6) = authority.strip_prefix('[') {
+        return v6.split_once(']').map(|(h, _)| h.to_string());
+    }
+    Some(
+        authority
+            .rsplit_once(':')
+            .map(|(h, p)| if p.chars().all(|c| c.is_ascii_digit()) { h } else { authority })
+            .unwrap_or(authority)
+            .to_string(),
+    )
+}
+
+/// `Ipv4Addr::is_link_local` exists but the v6 equivalent is unstable, so both
+/// are spelled out here.
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extracts_host() {
+        assert_eq!(host_of("https://a.com/x?y").as_deref(), Some("a.com"));
+        assert_eq!(host_of("http://a.com:8080/x").as_deref(), Some("a.com"));
+        assert_eq!(host_of("http://u:p@a.com/x").as_deref(), Some("a.com"));
+        assert_eq!(host_of("http://[::1]:80/x").as_deref(), Some("::1"));
+        assert_eq!(host_of("http://127.0.0.1").as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn refuses_to_fetch_the_router_itself() {
+        for url in [
+            "http://127.0.0.1/cgi-bin/luci",
+            "http://127.0.0.1:8088/api/state",
+            "http://localhost/x",
+            "http://[::1]/x",
+            "http://0.0.0.0/x",
+            "http://169.254.169.254/latest/meta-data",
+        ] {
+            let err = fetch(url, 5).unwrap_err();
+            assert!(err.contains("router itself"), "{url} gave: {err}");
+        }
+    }
 
     #[test]
     fn rejects_non_http_schemes() {

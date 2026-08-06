@@ -4,7 +4,7 @@ use crate::dnscfg;
 use crate::model::{Node, State};
 use serde_json::{json, Map, Value};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -15,6 +15,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 const SETTLE: Duration = Duration::from_millis(500);
 /// Poll interval within that window, so a failure is reported promptly.
 const POLL: Duration = Duration::from_millis(50);
+/// How much of the log the panel may read. See [`Supervisor::log_tail`].
+const TAIL_BYTES: u64 = 64 * 1024;
 
 /// Addresses that must never be tunnelled, so LAN and loopback stay reachable
 /// through the proxy port. Written out literally instead of `geoip:private` so
@@ -40,12 +42,15 @@ pub fn build_config(state: &State) -> Option<Value> {
     let s = &state.settings;
     let listen = if s.allow_lan { "0.0.0.0" } else { "127.0.0.1" };
 
+    // `routeOnly` keeps the sniffed domain for routing decisions but leaves the
+    // connection pointed at the address the client chose. Overriding the
+    // destination instead is what breaks Tor, Apple push notifications and
+    // several IoT devices -- Xray's own inbound docs call this out, and
+    // Passwall2 ships route-only for the same reason.
     let sniffing = json!({
         "enabled": true,
         "destOverride": ["http", "tls", "quic"],
-        // Keep the original domain so the remote server does the resolving.
-        // Without this, routing sees a pre-resolved IP and domain rules break.
-        "routeOnly": false
+        "routeOnly": s.sniff_route_only
     });
 
     let mut inbounds = vec![
@@ -103,8 +108,12 @@ pub fn build_config(state: &State) -> Option<Value> {
     };
 
     Some(json!({
-        "log": { "loglevel": loglevel },
+        // `access` is a separate stream from `loglevel` in Xray: without an
+        // explicit "none" it keeps emitting a line per connection regardless of
+        // level. On a busy LAN that is the single largest log producer.
+        "log": { "loglevel": loglevel, "access": "none" },
         "dns": build_dns(state),
+        "policy": build_policy(s.conn_idle_secs),
         "inbounds": inbounds,
         "outbounds": outbounds,
         "routing": {
@@ -114,6 +123,33 @@ pub fn build_config(state: &State) -> Option<Value> {
             ]
         }
     }))
+}
+
+/// Connection lifetime policy.
+///
+/// `connIdle` is the most consequential number in this whole config once
+/// transparent proxying is on. TPROXY UDP carries no close signal, so Xray
+/// holds one socket per 4-tuple until this expires; at the stock 300s a single
+/// torrent client creates sockets faster than they are reclaimed and the router
+/// dies of fd exhaustion or OOM. This is the most-reported router failure in
+/// Xray's own issue tracker (#5263, #4586, #4194), maintainer-diagnosed.
+///
+/// `bufferSize` is deliberately NOT set. On 32-bit ARM Xray already defaults to
+/// no internal buffer, and the value `0` now means *unlimited* rather than
+/// *disabled* -- so copying the widely-repeated "set bufferSize low on routers"
+/// advice from x86 guides would make memory use worse, not better.
+fn build_policy(conn_idle_secs: u32) -> Value {
+    json!({
+        "levels": {
+            "0": {
+                "handshake": 4,
+                "connIdle": conn_idle_secs,
+                "uplinkOnly": 2,
+                "downlinkOnly": 2
+            }
+        },
+        "system": { "statsInboundUplink": false, "statsInboundDownlink": false }
+    })
 }
 
 /// DNS block. The resolvers come from the panel's preset picker.
@@ -279,6 +315,12 @@ fn non_empty<'a>(v: &'a str, default: &'a str) -> &'a str {
 pub struct Paths {
     /// Generated Xray config. Lives on tmpfs to spare the router's flash.
     pub config: PathBuf,
+    /// Where a candidate config is validated before it replaces `config`.
+    ///
+    /// Keeps the `.json` extension deliberately: Xray infers the config format
+    /// from the file name, so `config.json.next` makes `run -test` fail with
+    /// "Failed to get format" regardless of the contents.
+    pub staged: PathBuf,
     /// Xray's stdout/stderr.
     pub log: PathBuf,
 }
@@ -287,6 +329,7 @@ impl Paths {
     pub fn new(runtime_dir: &Path) -> Self {
         Self {
             config: runtime_dir.join("config.json"),
+            staged: runtime_dir.join("config.staged.json"),
             log: runtime_dir.join("xray.log"),
         }
     }
@@ -304,6 +347,9 @@ pub struct Supervisor {
     pub running_node: String,
     /// When the log was last emptied, for the age-based cap.
     log_rotated_at: Instant,
+    /// Serialized config the running process was started with, so an `apply`
+    /// that changes nothing does not restart it.
+    applied: Option<Vec<u8>>,
 }
 
 impl Supervisor {
@@ -315,6 +361,7 @@ impl Supervisor {
             started_at: 0,
             running_node: String::new(),
             log_rotated_at: Instant::now(),
+            applied: None,
         }
     }
 
@@ -372,19 +419,11 @@ impl Supervisor {
     /// With no node selected this stops Xray and succeeds -- "off" is a valid
     /// state, not an error.
     pub fn apply(&mut self, state: &State) -> Result<(), String> {
-        self.stop();
-
         let Some(config) = build_config(state) else {
+            self.stop();
             self.last_error.clear();
             return Ok(());
         };
-
-        if let Some(dir) = self.paths.config.parent() {
-            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-        }
-        let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
-        write_atomic(&self.paths.config, &body)
-            .map_err(|e| format!("cannot write config: {e}"))?;
 
         let bin = &state.settings.xray_bin;
         if !Path::new(bin).exists() {
@@ -393,12 +432,73 @@ impl Supervisor {
             return Err(msg);
         }
 
+        if let Some(dir) = self.paths.config.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        }
+
+        // Stage and validate before touching the running instance. Xray's own
+        // parser is the only thing that knows whether a config is acceptable,
+        // and asking it costs about a second -- far better than killing a
+        // working tunnel to discover the replacement was rejected. Every mature
+        // OpenWrt proxy app does this (`xray run -test`, `sing-box check`,
+        // `mihomo -t`); the earlier version here did not, so a bad node
+        // dropped your connection before the error surfaced.
+        let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
+
+        // Nothing changed and it is already running: leave it alone. Renaming a
+        // node, removing an unused one or refreshing a subscription that
+        // returned identical content all reach this point, and restarting for
+        // them drops every live connection -- which in transparent mode is the
+        // whole LAN's traffic, for a cosmetic edit.
+        if self.child.is_some() && self.applied.as_deref() == Some(body.as_slice()) && self.is_running()
+        {
+            return Ok(());
+        }
+
+        // Must still end in `.json`: Xray infers the config format from the
+        // file extension, so a staging name like `config.json.next` makes
+        // `run -test` fail with "Failed to get format" no matter what is
+        // inside it.
+        let staged = self.paths.staged.clone();
+        debug_assert_eq!(staged.extension().and_then(|e| e.to_str()), Some("json"));
+        write_atomic(&staged, &body).map_err(|e| format!("cannot write config: {e}"))?;
+
+        if let Err(e) = test_config(bin, &staged) {
+            let _ = fs::remove_file(&staged);
+            self.last_error = e.clone();
+            return Err(e); // the previous instance is untouched and still running
+        }
+
+        fs::rename(&staged, &self.paths.config)
+            .map_err(|e| format!("cannot install config: {e}"))?;
+        self.applied = Some(body);
+
+        self.stop();
+
         let mut cmd = Command::new(bin);
         cmd.arg("run")
             .arg("-c")
             .arg(&self.paths.config)
             .stdin(Stdio::null());
         set_die_with_parent(&mut cmd);
+
+        // Two layers of memory containment, for different failure shapes.
+        //
+        // GOMEMLIMIT is a *soft* ceiling: Go collects more aggressively as it
+        // approaches, trading CPU for memory, and never fails an allocation.
+        // It is the right default because the worst case is a slower router,
+        // not a dead one.
+        if state.settings.go_mem_limit_mb > 0 {
+            cmd.env(
+                "GOMEMLIMIT",
+                format!("{}MiB", state.settings.go_mem_limit_mb),
+            );
+        }
+        // RLIMIT_DATA is the *hard* backstop for a genuine runaway. Xray dies
+        // with an allocation failure and this supervisor restarts it, instead
+        // of the kernel OOM-killer picking a victim at random -- which on a
+        // router is as likely to be dnsmasq or the network stack.
+        set_memory_cap(&mut cmd, state.settings.mem_hard_cap_mb);
 
         if state.settings.log_enabled {
             // O_APPEND is load-bearing, not a style choice. The janitor
@@ -472,10 +572,35 @@ impl Supervisor {
     }
 
     /// Tail of the Xray log, most recent `lines` lines.
+    ///
+    /// Reads only the last [`TAIL_BYTES`] rather than the whole file. Slurping
+    /// the file would mean that if the size cap were ever misconfigured or the
+    /// janitor stalled, one click on "view log" allocates the entire file --
+    /// and on a router with ~260MB free that is how a log viewer OOM-kills the
+    /// daemon it was meant to help debug.
     pub fn log_tail(&self, lines: usize) -> String {
-        let Ok(text) = fs::read_to_string(&self.paths.log) else {
+        let Ok(mut file) = File::open(&self.paths.log) else {
             return String::new();
         };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let from = len.saturating_sub(TAIL_BYTES);
+        if from > 0 && file.seek(SeekFrom::Start(from)).is_err() {
+            return String::new();
+        }
+
+        let mut buf = Vec::with_capacity(TAIL_BYTES.min(len) as usize);
+        if file.take(TAIL_BYTES).read_to_end(&mut buf).is_err() {
+            return String::new();
+        }
+        let text = String::from_utf8_lossy(&buf);
+        // A mid-file seek almost certainly lands inside a line; drop the
+        // fragment so the first line shown is a real one.
+        let text = if from > 0 {
+            text.split_once('\n').map(|(_, rest)| rest).unwrap_or("")
+        } else {
+            &text
+        };
+
         let all: Vec<&str> = text.lines().collect();
         let start = all.len().saturating_sub(lines);
         all[start..].join("\n")
@@ -491,6 +616,74 @@ impl Drop for Supervisor {
         self.stop();
     }
 }
+
+/// Asks Xray whether it would accept this config, without starting it.
+///
+/// Every mature OpenWrt proxy app does this before restarting its core
+/// (`xray run -test`, `sing-box check`, `mihomo -t`). It costs about a second
+/// and it is what lets a rejected config leave the running tunnel alone.
+fn test_config(bin: &str, config: &Path) -> Result<(), String> {
+    let out = Command::new(bin)
+        .arg("run")
+        .arg("-test")
+        .arg("-c")
+        .arg(config)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run xray: {e}"))?;
+
+    if out.status.success() {
+        return Ok(());
+    }
+    // Xray prints the reason to stdout, not stderr.
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let detail = last_error_line(&text);
+    Err(if detail.is_empty() {
+        "xray rejected the generated config".into()
+    } else {
+        detail
+    })
+}
+
+/// Caps the child's address space, so a runaway allocation fails in Xray
+/// instead of inviting the kernel's OOM killer to shoot something else.
+///
+/// `0` disables it. This is the hard backstop; [`Settings::go_mem_limit_mb`]
+/// is the soft one that should normally do the work.
+#[cfg(target_os = "linux")]
+fn set_memory_cap(cmd: &mut Command, megabytes: u64) {
+    use std::os::unix::process::CommandExt;
+
+    if megabytes == 0 {
+        return;
+    }
+    let soft = megabytes.saturating_mul(1024 * 1024);
+    // A little headroom above the soft limit so the allocator can fail
+    // gracefully rather than being cut off mid-teardown.
+    let hard = soft.saturating_add(soft / 8);
+
+    // SAFETY: runs between fork and exec. setrlimit is a single syscall and
+    // therefore async-signal-safe.
+    unsafe {
+        cmd.pre_exec(move || {
+            let lim = libc::rlimit {
+                rlim_cur: soft as libc::rlim_t,
+                rlim_max: hard as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_DATA, &lim) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_memory_cap(_cmd: &mut Command, _megabytes: u64) {}
 
 /// Picks the most informative line out of an Xray log for error reporting.
 ///
@@ -545,14 +738,35 @@ fn set_die_with_parent(_cmd: &mut Command) {}
 
 /// Writes via a temp file and rename, so a crash mid-write cannot leave a
 /// truncated config that Xray would refuse to start with.
+///
+/// The file is created `0600`. Both files written through here -- the state
+/// file and the generated Xray config -- contain node UUIDs and REALITY keys,
+/// and `File::create`'s default `0644` would leave them readable by every other
+/// process on the router.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut f = File::create(&tmp)?;
+        let mut f = create_private(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
     }
     fs::rename(&tmp, path)
+}
+
+#[cfg(unix)]
+fn create_private(path: &Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+}
+
+#[cfg(not(unix))]
+fn create_private(path: &Path) -> std::io::Result<File> {
+    File::create(path)
 }
 
 pub fn now_secs() -> u64 {
@@ -846,7 +1060,28 @@ mod tests {
 
         let dir = scratch("settle-ok");
         let fake = dir.join("fake-xray");
-        fs::write(&fake, "#!/bin/sh\nexec sleep 30\n").unwrap();
+        // Mimics the real binary closely enough to be useful: it answers
+        // `run -test` immediately, and it *rejects a config whose name does not
+        // end in .json*, because Xray reads the format from the extension. An
+        // earlier double ignored that and let a staging filename of
+        // `config.json.next` ship -- which made every start fail on the router
+        // while the tests stayed green.
+        fs::write(
+            &fake,
+            "#!/bin/sh\n\
+             test_mode=0\n\
+             for a in \"$@\"; do\n\
+               case \"$a\" in\n\
+                 -test) test_mode=1 ;;\n\
+                 *.json) cfg=1 ;;\n\
+                 /*) cfg=0 ;;\n\
+               esac\n\
+             done\n\
+             [ \"$cfg\" = 1 ] || { echo 'Failed to get format'; exit 23; }\n\
+             [ \"$test_mode\" = 1 ] && exit 0\n\
+             exec sleep 30\n",
+        )
+        .unwrap();
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
 
         let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
@@ -860,6 +1095,16 @@ mod tests {
 
         sup.stop();
         assert!(!sup.is_running());
+    }
+
+    /// Regression: the staging file was once `config.json.next`, whose
+    /// extension Xray cannot map to a format, so `run -test` rejected every
+    /// config and the core never started.
+    #[test]
+    fn staged_config_keeps_a_json_extension() {
+        let p = Paths::new(Path::new("/var/etc/xrayop"));
+        assert_eq!(p.staged.extension().and_then(|e| e.to_str()), Some("json"));
+        assert_ne!(p.staged, p.config, "staging must not overwrite the live config");
     }
 
     #[test]

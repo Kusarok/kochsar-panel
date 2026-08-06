@@ -227,6 +227,23 @@ pre.log{
 </head>
 <body>
 
+<!-- Shown until a valid token is stored. The panel HTML itself is public --
+     it carries no data -- so this is the only gate the user ever sees. -->
+<div id="login" hidden style="flex:1;display:flex;align-items:center;justify-content:center;padding:24px">
+  <div class="card" style="max-width:420px;width:100%">
+    <div class="brand" style="margin-bottom:6px">xray<span>op</span></div>
+    <p class="note" data-t="tokenHelp"></p>
+    <pre class="log" style="max-height:none;margin:0 0 14px" data-t="tokenCmd"></pre>
+    <div class="field">
+      <label data-t="token">Panel token</label>
+      <input id="tokenInput" dir="ltr" autocomplete="off" spellcheck="false">
+    </div>
+    <button class="btn pri" id="btnLogin" style="width:100%" data-t="unlock">Unlock</button>
+    <div id="loginErr"></div>
+  </div>
+</div>
+
+<div id="app" hidden style="display:contents">
 <header>
   <div class="brand">xray<span>op</span></div>
   <div class="grow"></div>
@@ -406,8 +423,40 @@ pre.log{
     </details>
 
     <details class="sec">
+      <summary data-t="resources">Resource limits</summary>
+      <div class="sec-body">
+        <p class="note" data-t="resNote"></p>
+        <div class="row">
+          <div class="field">
+            <label data-t="connIdle">Idle timeout (s)</label>
+            <input id="connIdle" type="number" min="30" max="600" dir="ltr">
+          </div>
+          <div class="field">
+            <label data-t="goMem">Go memory limit (MB)</label>
+            <input id="goMem" type="number" min="0" max="512" dir="ltr">
+          </div>
+          <div class="field">
+            <label data-t="hardCap">Hard cap (MB, 0=off)</label>
+            <input id="hardCap" type="number" min="0" max="512" dir="ltr">
+          </div>
+        </div>
+        <div class="tog">
+          <div class="t"><span data-t="routeOnly">Route-only sniffing</span>
+            <small data-t="routeOnlyHint"></small></div>
+          <button class="sw" id="swRouteOnly" role="switch"></button>
+        </div>
+        <button class="btn pri" id="btnSaveRes" style="margin-top:12px" data-t="save">Save</button>
+      </div>
+    </details>
+
+    <details class="sec">
       <summary data-t="about">About</summary>
-      <div class="sec-body" id="aboutBox"></div>
+      <div class="sec-body" id="aboutBox">
+        <div class="row" style="margin-top:12px">
+          <button class="btn" id="btnRestore" data-t="restore">Restore server list</button>
+          <button class="btn dang" id="btnForget" data-t="forget">Forget token</button>
+        </div>
+      </div>
     </details>
   </section>
 </main>
@@ -426,6 +475,7 @@ pre.log{
     <span data-t="settings">Settings</span>
   </button>
 </nav>
+</div>
 
 <div id="toast"></div>
 
@@ -475,6 +525,16 @@ const I18N = {
     reachable:"{0} of {1} reachable", best:"fastest: {0} ({1} ms)",
     never:"never", agoMin:"{0} min ago", agoHour:"{0} h ago", agoDay:"{0} d ago", agoNow:"just now",
     nodeCount:"{0} servers", lastUpdate:"updated {0}",
+    token:"Panel token", unlock:"Unlock", badToken:"Wrong token",
+    tokenHelp:"The panel is protected by a token generated on this router. Read it over SSH:",
+    tokenCmd:"logread | grep 'panel token' -A2",
+    resources:"Resource limits",
+    resNote:"Defaults come from documented router failures. Idle timeout is the important one: TPROXY UDP has no close signal, so Xray holds a socket per flow until it expires.",
+    connIdle:"Idle timeout (s)", goMem:"Go memory limit (MB)", hardCap:"Hard cap (MB, 0=off)",
+    routeOnly:"Route-only sniffing",
+    routeOnlyHint:"Keeps the original destination. Turning this off breaks Tor, Apple push and some IoT devices.",
+    restore:"Restore server list", forget:"Forget token",
+    restored:"{0} servers restored",
   },
   fa: {
     home:"خانه", servers:"سرورها", settings:"تنظیمات",
@@ -515,6 +575,16 @@ const I18N = {
     reachable:"{0} از {1} در دسترس", best:"سریع‌ترین: {0} ({1} میلی‌ثانیه)",
     never:"هرگز", agoMin:"{0} دقیقه پیش", agoHour:"{0} ساعت پیش", agoDay:"{0} روز پیش", agoNow:"لحظاتی پیش",
     nodeCount:"{0} سرور", lastUpdate:"به‌روزرسانی {0}",
+    token:"توکن پنل", unlock:"باز کردن", badToken:"توکن نادرست است",
+    tokenHelp:"پنل با یک توکن که روی همین روتر ساخته شده محافظت می‌شود. با SSH بخوانیدش:",
+    tokenCmd:"logread | grep 'panel token' -A2",
+    resources:"محدودیت منابع",
+    resNote:"مقادیر پیش‌فرض از خرابی‌های مستندشدهٔ روترها آمده. مهم‌ترین‌شان مهلت بی‌کاری است: در TPROXY هیچ سیگنال بسته‌شدن برای UDP وجود ندارد، پس Xray برای هر جریان یک سوکت نگه می‌دارد تا این مهلت تمام شود.",
+    connIdle:"مهلت بی‌کاری (ثانیه)", goMem:"سقف حافظهٔ Go (مگابایت)", hardCap:"سقف سخت (۰ = خاموش)",
+    routeOnly:"شنود فقط برای مسیریابی",
+    routeOnlyHint:"مقصد اصلی را دست‌نخورده نگه می‌دارد. خاموش‌کردنش Tor، اعلان‌های اپل و بعضی دستگاه‌های IoT را می‌شکند.",
+    restore:"بازگرداندن لیست سرورها", forget:"فراموش‌کردن توکن",
+    restored:"{0} سرور بازگردانده شد",
   },
 };
 
@@ -559,16 +629,25 @@ function toast(msg, kind) {
   toast._t = setTimeout(() => { n.className = ""; }, 3800);
 }
 
+let token = localStorage.getItem("xrayop.token") || "";
+
 async function api(path, body) {
-  const opts = body === undefined
-    ? { method: "GET" }
-    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
+  const headers = { "X-Xrayop-Token": token };
+  let opts = { method: "GET", headers };
+  if (body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    opts = { method: "POST", headers, body: JSON.stringify(body) };
+  }
   const res = await fetch(path, opts);
   let data = {};
   try { data = await res.json(); } catch (_) {}
+  if (res.status === 401) { showLogin(); throw new Error(t("badToken")); }
   if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
   return data;
 }
+
+function showLogin() { $("#login").hidden = false; $("#app").hidden = true; }
+function hideLogin() { $("#login").hidden = true; $("#app").hidden = false; }
 
 // Serialises actions so a double tap cannot fire two restarts at once.
 async function run(fn, okMsg) {
@@ -771,6 +850,11 @@ function renderSettings() {
   $("#swLog").className = "sw" + (s.log_enabled ? " on" : "");
   $("#logOpts").hidden = !s.log_enabled;
 
+  set("#connIdle", s.conn_idle_secs);
+  set("#goMem", s.go_mem_limit_mb);
+  set("#hardCap", s.mem_hard_cap_mb);
+  $("#swRouteOnly").className = "sw" + (s.sniff_route_only ? " on" : "");
+
   const box = $("#aboutBox");
   box.replaceChildren();
   const kv = (k, v) => {
@@ -883,11 +967,46 @@ $("#btnLog").onclick = async () => {
   } catch (e) { toast(e.message, "bad"); }
 };
 
+$("#btnSaveRes").onclick = () => run(() => api("/api/settings", {
+  conn_idle_secs:  Number($("#connIdle").value),
+  go_mem_limit_mb: Number($("#goMem").value),
+  mem_hard_cap_mb: Number($("#hardCap").value),
+}));
+$("#swRouteOnly").onclick = () =>
+  run(() => api("/api/settings", { sniff_route_only: !state.settings.sniff_route_only }));
+
+$("#btnRestore").onclick = () => run(async () => {
+  const r = await api("/api/nodes/restore", {});
+  toast(t("restored", r.restored), "good");
+  return r;
+});
+$("#btnForget").onclick = () => {
+  localStorage.removeItem("xrayop.token");
+  token = "";
+  showLogin();
+};
+
+// --- login ---
+function tryLogin(value) {
+  token = value.trim();
+  api("/api/state").then(s => {
+    localStorage.setItem("xrayop.token", token);
+    state = s;
+    hideLogin();
+    render();
+  }).catch(e => {
+    const box = $("#loginErr");
+    box.replaceChildren(el("div", "err", e.message));
+  });
+}
+$("#btnLogin").onclick = () => tryLogin($("#tokenInput").value);
+$("#tokenInput").onkeydown = (e) => { if (e.key === "Enter") tryLogin($("#tokenInput").value); };
+
 // Light polling keeps the status honest without hammering the router. Skipped
 // while an action is in flight so it cannot clobber a pending render.
-setInterval(() => { if (!busy) refresh(); }, 6000);
+setInterval(() => { if (!busy && token) refresh(); }, 6000);
 applyLang();
-refresh();
+if (token) { hideLogin(); refresh(); } else { showLogin(); }
 </script>
 </body>
 </html>

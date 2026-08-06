@@ -14,6 +14,8 @@ use crate::xray::{self, Paths, Supervisor};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 /// What a subscription refresh produced, for display in the panel.
 #[derive(Debug, Default)]
@@ -33,6 +35,14 @@ pub struct App {
     /// Unix seconds by which a pending transparent-proxy change must be
     /// confirmed; 0 when nothing is pending.
     pub tproxy_deadline: u64,
+    /// Whether our nftables table is loaded.
+    ///
+    /// Cached because answering it forks `nft`, and the panel polls state every
+    /// six seconds. Refreshed by the handlers that can change it.
+    pub tproxy_applied: bool,
+    /// Set while a latency sweep is running, so a user hammering "test all"
+    /// cannot pin every worker thread at once.
+    pub probing: Arc<AtomicBool>,
     state_path: PathBuf,
 }
 
@@ -67,19 +77,21 @@ impl App {
             sup: Supervisor::new(Paths::new(runtime_dir)),
             tproxy_guard: crate::tproxy::Watchdog::new(),
             tproxy_deadline: 0,
+            tproxy_applied: false,
+            probing: Arc::new(AtomicBool::new(false)),
             state_path,
         };
         (app, warning)
     }
 
-    /// Addresses of the active server, for the transparent-proxy bypass set.
+    /// Hostname of the active server, for the caller to resolve.
     ///
-    /// Resolves DNS, so callers must not hold the state lock across it.
-    pub fn active_server_ips(&self) -> Vec<std::net::IpAddr> {
-        self.state
-            .find(&self.state.active)
-            .map(|n| crate::probe::resolve_all(&n.server))
-            .unwrap_or_default()
+    /// Returns the name rather than the addresses because resolving blocks --
+    /// on musl for up to five seconds against a flaky upstream -- and this
+    /// method is reached while the state lock is held. Resolve with
+    /// [`crate::probe::resolve_all`] after dropping the guard.
+    pub fn active_server_host(&self) -> Option<String> {
+        self.state.find(&self.state.active).map(|n| n.server.clone())
     }
 
     /// Builds the ruleset plan. `server_ips` comes from
