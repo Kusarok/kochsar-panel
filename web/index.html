@@ -423,6 +423,19 @@ pre.log{
     </details>
 
     <details class="sec">
+      <summary data-t="testing">Connection test</summary>
+      <div class="sec-body">
+        <p class="note" data-t="testNote"></p>
+        <div class="grid" id="targetGrid" style="margin-bottom:14px"></div>
+        <div class="field">
+          <label data-t="customUrl">Custom URL</label>
+          <input id="testUrl" dir="ltr" placeholder="https://example.com/generate_204" autocomplete="off">
+        </div>
+        <button class="btn pri" id="btnTestUrl" data-t="apply">Apply</button>
+      </div>
+    </details>
+
+    <details class="sec">
       <summary data-t="resources">Resource limits</summary>
       <div class="sec-body">
         <p class="note" data-t="resNote"></p>
@@ -535,6 +548,10 @@ const I18N = {
     routeOnlyHint:"Keeps the original destination. Turning this off breaks Tor, Apple push and some IoT devices.",
     restore:"Restore server list", forget:"Forget token",
     restored:"{0} servers restored",
+    testing:"Connection test", customUrl:"Custom URL",
+    testNote:"Servers are tested by making a real request through each one. Pick the destination you actually care about — a server can reach Google and still fail on Instagram.",
+    testingNow:"Testing through {0}…",
+    testSkipped:"{0} not tested (list too long)",
   },
   fa: {
     home:"خانه", servers:"سرورها", settings:"تنظیمات",
@@ -585,6 +602,10 @@ const I18N = {
     routeOnlyHint:"مقصد اصلی را دست‌نخورده نگه می‌دارد. خاموش‌کردنش Tor، اعلان‌های اپل و بعضی دستگاه‌های IoT را می‌شکند.",
     restore:"بازگرداندن لیست سرورها", forget:"فراموش‌کردن توکن",
     restored:"{0} سرور بازگردانده شد",
+    testing:"تست اتصال", customUrl:"نشانی دلخواه",
+    testNote:"هر سرور با یک درخواست واقعی از داخل خودش تست می‌شود. مقصدی را انتخاب کنید که واقعاً برایتان مهم است — یک سرور می‌تواند به گوگل برسد ولی روی اینستاگرام کار نکند.",
+    testingNow:"در حال تست از طریق {0}…",
+    testSkipped:"{0} سرور تست نشد (لیست بلند است)",
   },
 };
 
@@ -711,7 +732,7 @@ function render() {
   if (st.last_error) banner.appendChild(el("div", "err", st.last_error));
 
   startUptime(on ? st.started_at : 0);
-  renderNodes(); renderSubs(); renderDns(); renderTproxy(); renderSettings();
+  renderNodes(); renderSubs(); renderDns(); renderTargets(); renderTproxy(); renderSettings();
 }
 
 let uptimeTimer = null;
@@ -800,6 +821,21 @@ function renderDns() {
     grid.appendChild(b);
   }
   if (document.activeElement !== $("#dnsCustom")) $("#dnsCustom").value = state.settings.dns_custom || "";
+}
+
+function renderTargets() {
+  const grid = $("#targetGrid");
+  grid.replaceChildren();
+  for (const tgt of state.test_targets) {
+    const b = el("button", "dns" + (state.settings.test_target === tgt.key ? " sel" : ""));
+    b.appendChild(text(el("b"), tgt.label));
+    b.appendChild(text(el("div", "ip"), tgt.url.replace(/^https?:\/\//, "")));
+    b.onclick = () => run(() => api("/api/settings", { test_target: tgt.key }), tgt.label);
+    grid.appendChild(b);
+  }
+  if (document.activeElement !== $("#testUrl")) {
+    $("#testUrl").value = state.settings.test_url_custom || "";
+  }
 }
 
 function renderTproxy() {
@@ -906,9 +942,12 @@ $("#power").onclick = () => {
 };
 
 $("#btnTest").onclick = () => run(async () => {
+  const host = (state.test_url || "").replace(/^https?:\/\//, "").split("/")[0];
+  toast(t("testingNow", host));
   const r = await api("/api/test", {});
   toast(t("reachable", r.reachable, r.tested)
-      + (r.best ? " · " + t("best", r.best.name, r.best.latency) : ""), "good");
+      + (r.best ? " · " + t("best", r.best.name, r.best.latency) : "")
+      + (r.skipped ? " · " + t("testSkipped", r.skipped) : ""), "good");
   return r;
 });
 $("#btnFastest").onclick = () => run(() => api("/api/select", { id: "fastest" }));
@@ -966,6 +1005,10 @@ $("#btnLog").onclick = async () => {
     text(box, r.log || "—");
   } catch (e) { toast(e.message, "bad"); }
 };
+
+$("#btnTestUrl").onclick = () => run(() => api("/api/settings", {
+  test_target: "custom", test_url_custom: $("#testUrl").value,
+}));
 
 $("#btnSaveRes").onclick = () => run(() => api("/api/settings", {
   conn_idle_secs:  Number($("#connIdle").value),

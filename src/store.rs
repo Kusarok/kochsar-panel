@@ -9,7 +9,6 @@
 
 use crate::model::{Node, State, Subscription};
 use crate::parse;
-use crate::probe::Job;
 use crate::xray::{self, Paths, Supervisor};
 use std::collections::HashSet;
 use std::fs;
@@ -40,6 +39,8 @@ pub struct App {
     /// Cached because answering it forks `nft`, and the panel polls state every
     /// six seconds. Refreshed by the handlers that can change it.
     pub tproxy_applied: bool,
+    /// Whether dnsmasq is currently forwarding the LAN's queries to Xray.
+    pub dns_via_tunnel: bool,
     /// Set while a latency sweep is running, so a user hammering "test all"
     /// cannot pin every worker thread at once.
     pub probing: Arc<AtomicBool>,
@@ -78,6 +79,7 @@ impl App {
             tproxy_guard: crate::tproxy::Watchdog::new(),
             tproxy_deadline: 0,
             tproxy_applied: false,
+            dns_via_tunnel: false,
             probing: Arc::new(AtomicBool::new(false)),
             state_path,
         };
@@ -103,6 +105,7 @@ impl App {
             lan_interfaces: s.lan_list(),
             server_ips,
             tunnel_ipv6: s.tunnel_ipv6,
+            dns_redirect: s.dns_redirect,
         }
     }
 
@@ -304,11 +307,6 @@ impl App {
         }
         self.state.active = id.to_string();
         Ok(())
-    }
-
-    /// Jobs for a latency sweep. Cheap: call it, drop the lock, then probe.
-    pub fn probe_jobs(&self) -> Vec<Job> {
-        self.state.nodes.iter().map(Job::from).collect()
     }
 
     /// Writes probe results back. Unknown ids are ignored, since the list may

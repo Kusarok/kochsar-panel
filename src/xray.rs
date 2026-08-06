@@ -85,18 +85,60 @@ pub fn build_config(state: &State) -> Option<Value> {
             "streamSettings": { "sockopt": { "tproxy": "tproxy" } },
             "sniffing": sniffing
         }));
+
+        // dnsmasq forwards the LAN's queries here. Bound to loopback: only the
+        // router's own resolver should reach it, never a LAN client directly.
+        //
+        // This is the piece that makes transparent proxying actually private.
+        // Without it the client resolves a name *before* the tunnel sees
+        // anything, so a poisoned answer sends it to the wrong address and the
+        // tunnel faithfully delivers it there. By then the name is gone and the
+        // proxy has only an IP to work with.
+        inbounds.push(json!({
+            "tag": "dns-in",
+            "listen": "127.0.0.1",
+            "port": s.dns_port,
+            "protocol": "dokodemo-door",
+            "settings": {
+                // Nominal target; the `dns` outbound answers from the `dns`
+                // block instead, which is what gives DoH and caching.
+                "address": dnscfg::resolvers(s)
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "1.1.1.1".into()),
+                "port": 53,
+                "network": "tcp,udp"
+            }
+        }));
     }
 
-    let outbounds = json!([
+    let mut outbounds = vec![
         build_outbound(node, s.transparent),
-        {
+        json!({
             "tag": "direct",
             "protocol": "freedom",
             "settings": { "domainStrategy": "UseIP" },
             "streamSettings": { "sockopt": sockopt_mark(s.transparent) }
-        },
-        { "tag": "block", "protocol": "blackhole", "settings": {} }
-    ]);
+        }),
+        json!({ "tag": "block", "protocol": "blackhole", "settings": {} }),
+    ];
+
+    let mut rules = vec![json!({
+        "type": "field", "ip": PRIVATE_NETS, "outboundTag": "direct"
+    })];
+
+    if s.transparent {
+        // The `dns` outbound answers queries from Xray's own DNS client, so
+        // the panel's resolver choice is what actually gets used -- including
+        // DoH URLs, which a plain dokodemo forward could not handle.
+        outbounds.push(json!({ "tag": "dns-out", "protocol": "dns" }));
+        // Must precede the private-range rule: a resolver like 10.202.10.10 is
+        // inside RFC1918 and would otherwise be sent direct.
+        rules.insert(
+            0,
+            json!({ "type": "field", "inboundTag": ["dns-in"], "outboundTag": "dns-out" }),
+        );
+    }
 
     // With logging off, tell Xray not to produce lines at all rather than
     // producing them and discarding them -- formatting them costs CPU on a
@@ -116,12 +158,7 @@ pub fn build_config(state: &State) -> Option<Value> {
         "policy": build_policy(s.conn_idle_secs),
         "inbounds": inbounds,
         "outbounds": outbounds,
-        "routing": {
-            "domainStrategy": "AsIs",
-            "rules": [
-                { "type": "field", "ip": PRIVATE_NETS, "outboundTag": "direct" }
-            ]
-        }
+        "routing": { "domainStrategy": "AsIs", "rules": rules }
     }))
 }
 
@@ -180,6 +217,24 @@ fn sockopt_mark(transparent: bool) -> Value {
     } else {
         json!({})
     }
+}
+
+/// An outbound for the latency probe: the same server, a different tag, and
+/// none of the transparent-mode socket marking (the probe never touches the
+/// firewall, so a mark would only confuse things).
+pub fn probe_outbound(node: &Node, tag: &str) -> Value {
+    json!({
+        "tag": tag,
+        "protocol": "vless",
+        "settings": {
+            "vnext": [{
+                "address": node.server,
+                "port": node.port,
+                "users": [build_user(node)]
+            }]
+        },
+        "streamSettings": build_stream(node)
+    })
 }
 
 fn build_outbound(node: &Node, transparent: bool) -> Value {
@@ -606,6 +661,11 @@ impl Supervisor {
         all[start..].join("\n")
     }
 
+    /// Directory holding the generated config and log.
+    pub fn runtime_dir(&self) -> &Path {
+        self.paths.config.parent().unwrap_or(Path::new("/tmp"))
+    }
+
     pub fn config_path(&self) -> &Path {
         &self.paths.config
     }
@@ -622,7 +682,7 @@ impl Drop for Supervisor {
 /// Every mature OpenWrt proxy app does this before restarting its core
 /// (`xray run -test`, `sing-box check`, `mihomo -t`). It costs about a second
 /// and it is what lets a rejected config leave the running tunnel alone.
-fn test_config(bin: &str, config: &Path) -> Result<(), String> {
+pub fn test_config(bin: &str, config: &Path) -> Result<(), String> {
     let out = Command::new(bin)
         .arg("run")
         .arg("-test")
@@ -709,7 +769,7 @@ fn last_error_line(log: &str) -> String {
 /// with the proxy ports held, so the next start fails with "address in use".
 /// `PR_SET_PDEATHSIG` closes that gap in the kernel.
 #[cfg(target_os = "linux")]
-fn set_die_with_parent(cmd: &mut Command) {
+pub fn set_die_with_parent(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
 
     let parent = std::process::id() as libc::pid_t;
@@ -1018,6 +1078,38 @@ mod tests {
             5,
             "with O_APPEND the file restarts at zero; without it this would be 5005"
         );
+    }
+
+    #[test]
+    fn transparent_mode_serves_dns_through_the_tunnel() {
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        s.settings.transparent = true;
+        s.settings.dns_port = 5353;
+        let cfg = build_config(&s).unwrap();
+
+        let dns_in = cfg["inbounds"].as_array().unwrap().iter()
+            .find(|i| i["tag"] == "dns-in").expect("dns inbound");
+        assert_eq!(dns_in["port"], 5353);
+        assert_eq!(dns_in["listen"], "127.0.0.1",
+            "a LAN client must not be able to reach it directly");
+        assert_eq!(dns_in["settings"]["network"], "tcp,udp");
+
+        assert!(cfg["outbounds"].as_array().unwrap().iter()
+            .any(|o| o["tag"] == "dns-out" && o["protocol"] == "dns"));
+
+        // The DNS rule has to come first: an Iranian resolver like 10.202.10.10
+        // is inside RFC1918 and the private-range rule would send it direct.
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["inboundTag"][0], "dns-in");
+        assert_eq!(rules[0]["outboundTag"], "dns-out");
+    }
+
+    #[test]
+    fn no_dns_inbound_without_transparent_mode() {
+        let s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        let cfg = build_config(&s).unwrap();
+        assert!(!cfg["inbounds"].as_array().unwrap().iter().any(|i| i["tag"] == "dns-in"));
+        assert!(!cfg["outbounds"].as_array().unwrap().iter().any(|o| o["tag"] == "dns-out"));
     }
 
     #[test]

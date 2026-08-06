@@ -262,6 +262,25 @@ pub struct Settings {
     /// Passwall2 setup leaves IPv6 direct, and matching that avoids a surprise.
     #[serde(default)]
     pub tunnel_ipv6: bool,
+    /// Port of Xray's DNS inbound, which dnsmasq forwards the LAN's queries to.
+    #[serde(default = "d_dns_port")]
+    pub dns_port: u16,
+    /// Key into [`crate::dnscfg::TEST_TARGETS`], or `custom`.
+    #[serde(default = "d_test_target")]
+    pub test_target: String,
+    /// Used when `test_target == "custom"`.
+    #[serde(default)]
+    pub test_url_custom: String,
+    /// First port of the range the latency probe binds, one per node.
+    #[serde(default = "d_probe_base_port")]
+    pub probe_base_port: u16,
+    /// Redirect every LAN query to the router's resolver.
+    ///
+    /// On by default: a device with a hardcoded public resolver would otherwise
+    /// resolve names outside the tunnel, and the tunnel would then faithfully
+    /// carry the connection to whatever address it was handed.
+    #[serde(default = "d_true")]
+    pub dns_redirect: bool,
 }
 
 fn d_tproxy_port() -> u16 {
@@ -285,6 +304,17 @@ fn d_conn_idle() -> u32 {
 }
 fn d_true() -> bool {
     true
+}
+/// Loopback-only, so the choice just has to avoid the usual suspects.
+fn d_dns_port() -> u16 {
+    5353
+}
+fn d_test_target() -> String {
+    "google".into()
+}
+/// High and unremarkable; only ever bound on loopback and only during a sweep.
+fn d_probe_base_port() -> u16 {
+    24000
 }
 fn d_lan_interfaces() -> String {
     "br-lan".into()
@@ -323,6 +353,11 @@ impl Default for Settings {
             tproxy_port: d_tproxy_port(),
             lan_interfaces: d_lan_interfaces(),
             tunnel_ipv6: false,
+            dns_port: d_dns_port(),
+            dns_redirect: true,
+            test_target: d_test_target(),
+            test_url_custom: String::new(),
+            probe_base_port: d_probe_base_port(),
         }
     }
 }

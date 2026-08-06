@@ -68,6 +68,101 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
+/// Destinations offered for the connection test.
+///
+/// Which one you pick is a real choice, not a cosmetic one: a server can reach
+/// Google and still fail on Instagram, and the point of the test is to answer
+/// "does this server work for the thing I actually use". Endpoints are chosen
+/// to return a tiny response so the number reflects latency, not download size.
+#[derive(Debug, Clone, Serialize)]
+pub struct TestTarget {
+    pub key: &'static str,
+    pub label: &'static str,
+    pub url: &'static str,
+}
+
+pub const TEST_TARGETS: &[TestTarget] = &[
+    TestTarget {
+        key: "google",
+        label: "Google",
+        // 204 with an empty body -- the standard connectivity probe.
+        url: "https://www.google.com/generate_204",
+    },
+    TestTarget {
+        key: "youtube",
+        label: "YouTube",
+        url: "https://www.youtube.com/generate_204",
+    },
+    TestTarget {
+        key: "github",
+        label: "GitHub",
+        // A few words of plain text; the smallest thing GitHub's API serves.
+        url: "https://api.github.com/zen",
+    },
+    TestTarget {
+        key: "telegram",
+        label: "Telegram",
+        url: "https://api.telegram.org/",
+    },
+    TestTarget {
+        key: "instagram",
+        label: "Instagram",
+        url: "https://www.instagram.com/favicon.ico",
+    },
+    TestTarget {
+        key: "cloudflare",
+        label: "Cloudflare",
+        url: "https://cp.cloudflare.com/generate_204",
+    },
+    TestTarget {
+        key: "openai",
+        label: "OpenAI",
+        url: "https://api.openai.com/",
+    },
+];
+
+pub fn find_target(key: &str) -> Option<&'static TestTarget> {
+    TEST_TARGETS.iter().find(|t| t.key == key)
+}
+
+/// The URL to test against, resolved from the settings.
+///
+/// Falls back to Google rather than to nothing, so a stale or misspelled
+/// preset still produces a usable test instead of an error.
+pub fn test_url(settings: &Settings) -> String {
+    if settings.test_target == "custom" {
+        let u = settings.test_url_custom.trim();
+        if is_valid_test_url(u) {
+            return u.to_string();
+        }
+    }
+    find_target(&settings.test_target)
+        .or_else(|| find_target("google"))
+        .map(|t| t.url.to_string())
+        .unwrap_or_default()
+}
+
+/// Only http(s), and never the router itself -- a test that passes because it
+/// reached the local web server would be worse than no test at all.
+pub fn is_valid_test_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+        return false;
+    }
+    let host = lower
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or("")
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("");
+    if host.is_empty() {
+        return false;
+    }
+    let bare = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
+    !(bare == "localhost" || bare.starts_with("127.") || bare == "::1")
+}
+
 pub fn find(key: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.key == key)
 }

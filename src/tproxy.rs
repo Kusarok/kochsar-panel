@@ -105,6 +105,9 @@ pub struct Plan {
     pub server_ips: Vec<std::net::IpAddr>,
     /// Whether to tunnel IPv6 as well as IPv4.
     pub tunnel_ipv6: bool,
+    /// Force every LAN DNS query to the router's resolver, so clients with a
+    /// hardcoded public resolver cannot resolve outside the tunnel.
+    pub dns_redirect: bool,
 }
 
 impl Plan {
@@ -180,6 +183,16 @@ pub fn build_ruleset(plan: &Plan) -> String {
     out.push_str("\t\t# Only intercept what the LAN sent us.\n");
     out.push_str(&format!("\t\tiifname != {{ {ifaces} }} counter return\n\n"));
 
+    // Port 53 is claimed by the `dns_redirect` chain in the nat hook, which
+    // runs later (dstnat -1 = -101) than this one (mangle -1 = -151). Without
+    // this exclusion the tproxy rule below would swallow every query first and
+    // the redirect would never see one. Passwall2 carries the identical
+    // `udp dport 53 return` for the same reason.
+    if plan.dns_redirect {
+        out.push_str("\t\t# DNS belongs to the redirect chain in the nat hook.\n");
+        out.push_str("\t\tmeta l4proto { tcp, udp } th dport 53 counter return\n\n");
+    }
+
     // The mark must be set *before* tproxy in the same rule: tproxy assigns the
     // packet to the local socket, and the `ip rule` lookup that delivers it
     // there reads the mark. Passwall2 emits them in this order too.
@@ -213,6 +226,25 @@ pub fn build_ruleset(plan: &Plan) -> String {
     out.push_str("\t\tcounter jump divert\n");
     out.push_str("\t\tmeta l4proto { tcp, udp } counter jump intercept\n");
     out.push_str("\t}\n\n");
+
+    // --- DNS redirect ---
+    //
+    // Sends every LAN query to the router's own resolver, whatever the client
+    // thinks it is talking to. A device with 8.8.8.8 hardcoded -- a smart TV,
+    // a phone with private DNS on, anything -- would otherwise resolve names
+    // outside the tunnel and hand the tunnel a poisoned address to connect to.
+    //
+    // `dstnat - 1` puts this ahead of fw4's own port forwards, matching what
+    // Passwall2 does, so a redirect cannot be pre-empted by an unrelated rule.
+    if plan.dns_redirect {
+        out.push_str("\tchain dns_redirect {\n");
+        out.push_str("\t\ttype nat hook prerouting priority dstnat - 1; policy accept;\n");
+        out.push_str(&format!("\t\tiifname != {{ {ifaces} }} counter return\n"));
+        // Queries already aimed at the router need no rewrite.
+        out.push_str("\t\tfib daddr type local counter return\n");
+        out.push_str("\t\tmeta l4proto { tcp, udp } th dport 53 counter redirect to :53\n");
+        out.push_str("\t}\n\n");
+    }
 
     // --- input guard ---
     //
@@ -534,6 +566,7 @@ mod tests {
             lan_interfaces: vec!["br-lan".into()],
             server_ips: vec!["203.0.113.7".parse().unwrap()],
             tunnel_ipv6: false,
+            dns_redirect: true,
         }
     }
 
@@ -587,6 +620,42 @@ mod tests {
             r.contains("iifname != \"lo\""),
             "loopback must stay allowed or xray cannot reach itself"
         );
+    }
+
+    /// Port 53 must leave the tproxy chain before the tproxy statements, or the
+    /// nat redirect (which runs later, at dstnat-1) never sees a query.
+    /// Passwall2 carries the identical exclusion.
+    #[test]
+    fn dns_is_excluded_from_tproxy_so_the_redirect_can_claim_it() {
+        let r = build_ruleset(&plan());
+        let excl = index_of(&r, "th dport 53 counter return");
+        let tproxy = index_of(&r, "tproxy ip to");
+        assert!(excl < tproxy, "the DNS exclusion must precede the tproxy rules");
+    }
+
+    #[test]
+    fn dns_redirect_chain_catches_hardcoded_resolvers() {
+        let r = build_ruleset(&plan());
+        assert!(r.contains("chain dns_redirect"));
+        assert!(r.contains("type nat hook prerouting priority dstnat - 1"));
+        assert!(r.contains("th dport 53 counter redirect to :53"));
+        // Queries already aimed at the router need no rewrite, and non-LAN
+        // traffic must not be touched at all.
+        let chain = r.split("chain dns_redirect").nth(1).unwrap();
+        let local = chain.find("fib daddr type local").unwrap();
+        let iface = chain.find("iifname !=").unwrap();
+        let redir = chain.find("redirect to :53").unwrap();
+        assert!(iface < local && local < redir);
+    }
+
+    #[test]
+    fn dns_redirect_can_be_turned_off_entirely() {
+        let mut p = plan();
+        p.dns_redirect = false;
+        let r = build_ruleset(&p);
+        assert!(!r.contains("chain dns_redirect"));
+        assert!(!r.contains("th dport 53 counter return"),
+            "with no redirect, DNS should go through tproxy like everything else");
     }
 
     #[test]

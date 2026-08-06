@@ -5,8 +5,10 @@
 //! * [`model`]  -- persisted types
 //! * [`parse`]  -- `vless://` and subscription decoding
 //! * [`net`]    -- subscription fetching (delegated to curl)
-//! * [`probe`]  -- concurrent TCP latency measurement
+//! * [`probe`]  -- name resolution helpers
+//! * [`latency`] -- real-delay measurement through each server
 //! * [`dnscfg`] -- DNS presets
+//! * [`dnsmasq`] -- pointing the LAN resolver at Xray
 //! * [`xray`]   -- config generation and process supervision
 //! * [`store`]  -- application state and its operations
 //! * [`api`]    -- HTTP panel and JSON API
@@ -17,6 +19,8 @@
 
 mod api;
 mod dnscfg;
+mod dnsmasq;
+mod latency;
 mod model;
 mod net;
 mod parse;
@@ -53,13 +57,14 @@ OPTIONS:
     --runtime <DIR>    Generated config and log  [default: /var/etc/xrayop]
     --dump-nft         Print the transparent-proxy ruleset and exit
     --check-nft        Validate that ruleset against the kernel and exit
+    --check-config     Ask xray to validate a transparent-mode config, and exit
     -h, --help         Print this help
     -V, --version      Print version
 
 Each option may also be set via XRAYOP_LISTEN, XRAYOP_STATE or XRAYOP_RUNTIME.
 The command line wins over the environment.
 
-The panel has no authentication yet. Bind it to a trusted LAN only.
+The panel requires a token, generated on first run and printed to the log.
 ";
 
 struct Args {
@@ -125,6 +130,12 @@ fn main() -> ExitCode {
             .map(|h| probe::resolve_all(&h))
             .unwrap_or_default();
         let plan = app.tproxy_plan(ips);
+        // The drop-in lives on tmpfs, so a reboot removed it; put it back
+        // before the rules start redirecting queries at it.
+        match dnsmasq::install(app.state.settings.dns_port) {
+            Ok(()) => app.dns_via_tunnel = true,
+            Err(e) => eprintln!("xrayopd: could not restore tunnelled DNS: {e}"),
+        }
         match tproxy::apply(&plan) {
             Ok(()) => app.tproxy_applied = true,
             Err(e) => {
@@ -143,6 +154,9 @@ fn main() -> ExitCode {
         // with the previous process.
         eprintln!("xrayopd: found transparent-proxy rules from a previous run; removing them");
         tproxy::revert(&app.tproxy_plan(Vec::new()));
+        if dnsmasq::is_installed() {
+            let _ = dnsmasq::remove();
+        }
     }
 
     println!(
@@ -191,6 +205,10 @@ fn parse_args() -> Result<Option<Args>, String> {
                 let check = arg == "--check-nft";
                 return dump_ruleset(&PathBuf::from(&state), check).map(|()| None);
             }
+            "--check-config" => {
+                return check_transparent_config(&PathBuf::from(&state), &PathBuf::from(&runtime))
+                    .map(|()| None);
+            }
             other => return Err(format!("unknown argument {other:?}")),
         }
     }
@@ -232,6 +250,38 @@ fn spawn_log_janitor(app: Arc<Mutex<App>>) {
     });
 }
 
+/// Generates the config transparent mode *would* use and asks Xray to validate
+/// it, without touching the running instance or the firewall.
+///
+/// The dry run matters because transparent mode adds inbounds, an outbound and
+/// a routing rule that no other code path exercises; the first time they are
+/// generated should not be the moment the LAN is depending on them.
+fn check_transparent_config(state_path: &std::path::Path, runtime: &std::path::Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(state_path).unwrap_or_default();
+    let mut state: model::State = serde_json::from_str(&text).unwrap_or_default();
+    if state.active.is_empty() {
+        return Err("select a node first; there is nothing to build a config from".into());
+    }
+    state.settings.transparent = true;
+
+    let config = xray::build_config(&state).ok_or("could not build a config")?;
+    let body = serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?;
+
+    // Same extension rule as the live path: xray reads the format from it.
+    let path = runtime.join("config.check.json");
+    std::fs::create_dir_all(runtime).map_err(|e| e.to_string())?;
+    xray::write_atomic(&path, &body).map_err(|e| e.to_string())?;
+
+    let result = xray::test_config(&state.settings.xray_bin, &path);
+    let _ = std::fs::remove_file(&path);
+    result?;
+
+    println!("{}", String::from_utf8_lossy(&body));
+    eprintln!("
+[ok] xray accepts the transparent-mode config (nothing was applied)");
+    Ok(())
+}
+
 /// Renders the transparent-proxy ruleset from saved settings, optionally
 /// validating it against the running kernel.
 ///
@@ -254,6 +304,7 @@ fn dump_ruleset(state_path: &std::path::Path, check: bool) -> Result<(), String>
         lan_interfaces: s.lan_list(),
         server_ips,
         tunnel_ipv6: s.tunnel_ipv6,
+        dns_redirect: s.dns_redirect,
     };
 
     print!("{}", tproxy::build_ruleset(&plan));

@@ -20,7 +20,9 @@
 //!   node's detail.
 
 use crate::dnscfg;
+use crate::dnsmasq;
 use crate::net;
+use crate::latency;
 use crate::probe;
 use crate::store::{App, SubSummary};
 use crate::tproxy;
@@ -40,7 +42,9 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const MAX_BODY: usize = 4 * 1024 * 1024;
 
 const SUB_TIMEOUT_SECS: u32 = 25;
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Per-node budget for the real-delay request. Generous enough for a distant
+/// server on a slow link, short enough that a dead one does not stall a sweep.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
 type Body = Response<Cursor<Vec<u8>>>;
 
@@ -141,6 +145,7 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
     // the panel polls this route every 6 seconds. The cached value is refreshed
     // by the tproxy handlers, which are the only things that change it.
     let tproxy_applied = app.tproxy_applied;
+    let dns_via_tunnel = app.dns_via_tunnel;
     let state = &app.state;
 
     let nodes: Vec<Value> = state
@@ -187,6 +192,8 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
         "settings": state.settings,
         "active": state.active,
         "dns_presets": dnscfg::PRESETS,
+        "test_targets": dnscfg::TEST_TARGETS,
+        "test_url": dnscfg::test_url(&state.settings),
         "dns_resolvers": dnscfg::resolvers(&state.settings),
         "status": {
             "running": running,
@@ -198,6 +205,7 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
         "tproxy": {
             "enabled": state.settings.transparent,
             "applied": tproxy_applied,
+            "dns_via_tunnel": dns_via_tunnel,
             // Non-zero means a change is on probation and will roll back.
             "deadline": app.tproxy_deadline,
             "armed": app.tproxy_guard.is_armed(),
@@ -351,38 +359,49 @@ fn handle_select(app: &Arc<Mutex<App>>, body: &Value) -> Body {
 }
 
 fn handle_test(app: &Arc<Mutex<App>>) -> Body {
-    let (jobs, gate) = {
+    let (nodes, settings, runtime, gate) = {
         let a = lock(app);
-        (a.probe_jobs(), Arc::clone(&a.probing))
+        (
+            a.state.nodes.clone(),
+            a.state.settings.clone(),
+            a.sup.runtime_dir().to_path_buf(),
+            Arc::clone(&a.probing),
+        )
     };
-    if jobs.is_empty() {
+    if nodes.is_empty() {
         return error(400, "there are no nodes to test");
     }
 
-    // One sweep at a time. A large list takes tens of seconds, and a user
-    // clicking a stalled button four times would otherwise pin all four worker
-    // threads and make the panel unresponsive until every sweep finished.
+    // One sweep at a time. A large list takes tens of seconds and starts a
+    // second xray instance; a user clicking a stalled button would otherwise
+    // pin every worker thread and stack probe instances.
     if gate.swap(true, Ordering::SeqCst) {
         return error(409, "a latency test is already running");
     }
-    // Released on every exit path below, including a panic in the sweep.
     let _release = ReleaseOnDrop(Arc::clone(&gate));
 
-    // Probing is seconds of network wait -- the lock must be released first.
-    let results = probe::probe_many(jobs, PROBE_TIMEOUT);
+    let url = dnscfg::test_url(&settings);
+    let outcome = match latency::measure(&nodes, &settings, &runtime, &url, PROBE_TIMEOUT) {
+        Ok(o) => o,
+        Err(e) => return error(500, &e),
+    };
 
     let mut a = lock(app);
-    a.apply_latencies(results);
+    a.apply_latencies(outcome.results);
     let reachable = a.state.nodes.iter().filter(|n| n.latency >= 0).count();
-    let best = a.fastest().map(|n| json!({ "id": n.id, "name": n.name, "latency": n.latency }));
+    let best = a
+        .fastest()
+        .map(|n| json!({ "id": n.id, "name": n.name, "latency": n.latency }));
     let total = a.state.nodes.len();
     let _ = a.save();
     drop(a);
 
     json_ok(json!({
         "ok": true,
-        "tested": total,
+        "tested": total.min(latency::MAX_NODES),
         "reachable": reachable,
+        "skipped": outcome.skipped,
+        "url": url,
         "best": best,
     }))
 }
@@ -525,6 +544,27 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
         }
         next.conn_idle_secs = v as u32;
     }
+    if let Some(raw) = body.get("test_target") {
+        let v = raw.as_str().unwrap_or_default();
+        if v != "custom" && dnscfg::find_target(v).is_none() {
+            return Err(format!("unknown test target {v:?}"));
+        }
+        next.test_target = v.to_string();
+        if v == "custom" {
+            let u = body
+                .get("test_url_custom")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            if !dnscfg::is_valid_test_url(u) {
+                return Err("the test URL must be http(s) and not point at the router".into());
+            }
+            next.test_url_custom = u.to_string();
+        }
+    }
+    if let Some(raw) = body.get("probe_base_port") {
+        next.probe_base_port = port_of(raw).ok_or("probe_base_port must be between 1 and 65535")?;
+    }
     if let Some(raw) = body.get("sniff_route_only") {
         next.sniff_route_only = raw.as_bool().ok_or("sniff_route_only must be true or false")?;
     }
@@ -615,21 +655,25 @@ fn handle_tproxy_enable(app: &Arc<Mutex<App>>) -> Body {
         }
     }
 
-    // 2. Then the ruleset.
+    // 2. Point the LAN's resolver at Xray before any rule redirects a query
+    //    to it, so no client ever meets a dead resolver.
+    let dns_port = lock(app).state.settings.dns_port;
+    if let Err(e) = dnsmasq::install(dns_port) {
+        rollback_tproxy(app);
+        return error(500, &format!("could not route DNS through the tunnel: {e}"));
+    }
+    lock(app).dns_via_tunnel = true;
+
+    // 3. Then the ruleset.
     {
-        let a = lock(app);
-        let plan = a.tproxy_plan(server_ips.clone());
-        drop(a);
+        let plan = lock(app).tproxy_plan(server_ips.clone());
         if let Err(e) = tproxy::apply(&plan) {
-            let mut a = lock(app);
-            a.state.settings.transparent = false;
-            let state = a.state.clone();
-            let _ = a.sup.apply(&state);
+            rollback_tproxy(app);
             return error(500, &e);
         }
     }
 
-    // 3. Arm the rollback. Deliberately *not* saved yet: if the router drops
+    // 4. Arm the rollback. Deliberately *not* saved yet: if the router drops
     //    off the network now, a reboot must come back without any of this.
     let deadline = xray::now_secs() + CONFIRM_SECS;
     let guard = {
@@ -682,8 +726,14 @@ fn handle_tproxy_disable(app: &Arc<Mutex<App>>) -> Body {
 /// the same order: stop redirecting before reconfiguring Xray, or the gap
 /// between the two black-holes traffic.
 fn rollback_tproxy(app: &Arc<Mutex<App>>) {
+    // Rules first, then DNS. Reversing this order would leave a window where
+    // the redirect still points at a resolver that has stopped forwarding.
     let plan = lock(app).tproxy_plan(Vec::new());
     tproxy::revert(&plan);
+    if let Err(e) = dnsmasq::remove() {
+        eprintln!("xrayop: could not restore dnsmasq: {e}");
+    }
+    lock(app).dns_via_tunnel = false;
 
     let mut a = lock(app);
     a.tproxy_guard.disarm();

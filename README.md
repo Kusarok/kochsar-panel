@@ -31,8 +31,8 @@ cycle, and the UI is whatever we want it to be rather than whatever CBI renders.
 - **Manual import** — paste one link or a hundred, plain or base64.
 - **VLESS** over TCP, WebSocket, gRPC, XHTTP and HTTPUpgrade, with REALITY, TLS
   or no encryption, including XTLS flows and uTLS fingerprints.
-- **Latency testing** — concurrent TCP handshake probes across the whole list,
-  plus one-click "connect to fastest".
+- **Latency testing** — a real HTTPS request through each server, measured
+  concurrently, plus one-click "connect to fastest".
 - **DNS presets** — Cloudflare, Google, Quad9, AdGuard, and the Iranian
   resolvers (Shecan, Electro, Begzar, Radar), or a custom list.
 - **Supervision** — Xray is started, restarted and stopped by the daemon. A core
@@ -46,7 +46,32 @@ cycle, and the UI is whatever we want it to be rather than whatever CBI renders.
 - VLESS only. VMess, Trojan, Shadowsocks and Hysteria links are counted as
   "unsupported" on import rather than parsed.
 - Latency is a TCP handshake, not end-to-end proxy delay.
-A reachable server can still fail to authenticate.
+---
+
+## Measuring latency
+
+Servers are ranked by making a real HTTPS request *through* each one, to a
+destination you choose.
+
+The obvious alternative -- timing a TCP handshake to the server's address --
+was implemented first and removed, because on a censored network it measures
+the censor. The hostname resolves to a nearby interception box that completes
+the handshake instantly, so every server reports about 0 ms and the list looks
+perfect while nothing works. It also rates the "update your subscription daily"
+notice that providers put in their node list as the fastest server available.
+
+One throwaway Xray instance is started with a SOCKS inbound per node and a
+routing rule pinning each inbound to its own outbound, so all nodes are
+measured concurrently through a single process rather than one process each.
+Unrouted traffic is blackholed: letting it out directly would make a dead
+server report the latency of the router's own connection.
+
+The destination is a setting, because it is a real choice -- a server can reach
+Google and still fail on Instagram. Presets cover Google, YouTube, GitHub,
+Telegram, Instagram, Cloudflare and OpenAI, each pointing at an endpoint that
+returns a tiny response so the number reflects latency rather than download
+size. A custom URL is accepted if it is http(s) and does not point at the
+router.
 
 ---
 
@@ -262,9 +287,45 @@ device.
 Inspect and validate without touching the firewall:
 
 ```bash
-xrayopd --dump-nft     # print the ruleset
-xrayopd --check-nft    # ask the kernel to validate it, applying nothing
+xrayopd --dump-nft        # print the ruleset
+xrayopd --check-nft       # ask the kernel to validate it, applying nothing
+xrayopd --check-config    # ask xray to validate the config it would run
 ```
+
+### DNS is the part that makes it private
+
+Without DNS handling, transparent proxying delivers a working tunnel to the
+wrong address. The client resolves a name *before* the proxy sees anything, so
+a poisoned answer sends it to an address the tunnel then faithfully connects
+to. By then the name is gone and the proxy has only an IP.
+
+The panel's DNS preset alone does not fix this: it configures Xray's *internal*
+resolver, which nothing on the LAN can query.
+
+```
+LAN client :53
+   │  nat prerouting, dstnat-1 — catches clients with a hardcoded resolver
+   ▼
+dnsmasq :53                      keeps .lan names, DHCP hostnames, cache
+   │  no-resolv + server=127.0.0.1#5353   (drop-in in dnsmasq's conf-dir)
+   ▼
+xray dns-in :5353 (loopback)
+   │  routing: inboundTag dns-in → dns-out
+   ▼
+dns outbound  →  the panel's chosen resolver, through the tunnel
+```
+
+Port 53 is explicitly **excluded** from the tproxy chain. The tproxy hook runs
+at `mangle - 1` (-151) and the redirect at `dstnat - 1` (-101), so without that
+exclusion tproxy would swallow every query before the redirect ever saw one.
+Passwall2 carries the identical `udp dport 53 return` for this reason.
+
+Passwall2 runs a *second* dnsmasq on a high port for this, cloned from the
+system config, because it supports per-client DNS policy and needs an instance
+it owns. We have one policy for the whole LAN, so a drop-in file plus a restart
+does the same job for ~2.6 MB less RAM. The drop-in lives on tmpfs, so a reboot
+removes it even if we never get the chance to; the daemon puts it back at
+startup when transparent mode is enabled.
 
 ### Enabling is a three-step handshake
 
