@@ -29,7 +29,6 @@
 //! replaced when the alternative is *clearly* better -- see [`is_worth_switching`].
 
 use crate::latency;
-use crate::model::Node;
 use crate::store::App;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -53,11 +52,25 @@ const FAILURES_BEFORE_FAILOVER: u32 = 3;
 const MIN_GAP: Duration = Duration::from_secs(300);
 
 /// A replacement must beat the current server by at least this fraction...
-const BETTER_BY: f64 = 0.65;
+const BETTER_BY: f64 = 0.80;
 /// ...and by at least this many milliseconds. Both, so neither a tiny
 /// proportional win on fast servers nor a large one on slow servers alone is
 /// enough.
-const BETTER_BY_MS: i32 = 250;
+const BETTER_BY_MS: i32 = 20;
+
+// These were 0.65 and 250 ms, chosen when [`crate::latency`] reported the cold
+// connection time and a subscription spread across 1400-2500 ms. It now reports
+// the warm round trip, and the same subscription spreads across 120-270 ms --
+// so a 250 ms absolute floor was wider than the entire range and no healthy
+// server could ever have been replaced. The feature would have looked enabled
+// and quietly never fired.
+//
+// 20 ms is close to the noise floor -- repeated warm measurements of one server
+// land within about 15 ms of each other -- and on its own it would be too eager.
+// It is safe only because [`BETTER_BY`] must also hold: above about 100 ms the
+// proportional test is the binding one, so the floor matters just for servers
+// fast enough that a fifth of their latency is under 20 ms. Lower this further
+// only together with a proportional threshold that can still carry the decision.
 
 #[derive(Debug, Default, Clone)]
 pub struct Status {
@@ -230,6 +243,7 @@ fn lock(app: &Arc<Mutex<App>>) -> std::sync::MutexGuard<'_, App> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Node;
 
     #[test]
     fn a_dead_server_is_replaced_by_anything_that_works() {
@@ -243,29 +257,47 @@ mod tests {
         assert!(!is_worth_switching(Node::LATENCY_FAILED, Node::LATENCY_FAILED));
     }
 
-    /// The measurements this compares swing by hundreds of milliseconds between
-    /// sweeps. Reacting to that would reconnect on every one.
+    /// Repeated warm measurements of one server land within about 15 ms of each
+    /// other. Reacting to that would reconnect on every sweep.
     #[test]
     fn small_improvements_do_not_trigger_a_reconnect() {
-        assert!(!is_worth_switching(1500, 1400)); // noise
-        assert!(!is_worth_switching(1500, 1000)); // 33%, real but not clear
-        assert!(!is_worth_switching(1500, 1200));
+        assert!(!is_worth_switching(135, 121)); // two good servers, 14ms apart
+        assert!(!is_worth_switching(179, 175));
+        assert!(!is_worth_switching(173, 161));
     }
 
     #[test]
     fn a_clear_improvement_does() {
-        assert!(is_worth_switching(1500, 800)); // 47% and 700ms
-        assert!(is_worth_switching(3000, 900));
+        assert!(is_worth_switching(173, 121)); // 30% and 52ms
+        assert!(is_worth_switching(270, 121));
     }
 
     /// Both tests must pass, so neither a big proportional win on already-fast
     /// servers nor a big absolute win on slow ones is enough alone.
     #[test]
     fn both_measures_are_required() {
-        // Half the latency, but only 100ms saved -- not worth a reconnect.
-        assert!(!is_worth_switching(200, 100));
-        // 1000ms saved, but only a 17% improvement -- the pair are comparable.
-        assert!(!is_worth_switching(6000, 5000));
+        // A quarter off, but only 12ms saved -- inside measurement noise.
+        assert!(!is_worth_switching(50, 38));
+        // 100ms saved, but only a tenth off -- the pair are comparable.
+        assert!(!is_worth_switching(1000, 900));
+    }
+
+    /// The thresholds have to fit the numbers [`crate::latency`] actually
+    /// produces. They once did not: an absolute floor wider than the whole
+    /// spread of a subscription meant no healthy server could be replaced, and
+    /// nothing said so -- the panel showed the feature enabled and it never
+    /// fired. Guard the relationship, not just the values.
+    #[test]
+    fn the_absolute_floor_fits_the_scale_it_judges() {
+        // A realistic subscription, warm: fastest to slowest.
+        let (fastest, slowest) = (121, 270);
+        assert!(
+            BETTER_BY_MS < slowest - fastest,
+            "a floor of {BETTER_BY_MS}ms cannot be crossed within a {}ms spread",
+            slowest - fastest
+        );
+        // ...and the worst server in that spread must be replaceable by the best.
+        assert!(is_worth_switching(slowest, fastest));
     }
 
     /// Every switch drops live connections, so the floor between them has to be

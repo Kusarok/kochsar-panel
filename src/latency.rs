@@ -19,21 +19,49 @@
 //!
 //! One process with N inbounds rather than N processes: on a router, starting
 //! a Go binary per node would cost more than the measurement is worth.
+//!
+//! ## Warm, not cold
+//!
+//! Each node is asked for the same URL twice over one kept-alive connection,
+//! and the smaller time is reported. The first request builds the tunnel; the
+//! second travels through it.
+//!
+//! Reporting the first was a real bug. A cold measurement is dominated by
+//! handshake arithmetic, and on an armv7 router without crypto acceleration
+//! that is hundreds of milliseconds of CPU -- the same for every server, large
+//! enough to bury the differences between them, and variable with how many
+//! probes are running. Servers ended up ordered by scheduling luck. The user
+//! caught it: their phone ranked a server first that this ranked near last.
+//!
+//! It also makes the panel's numbers comparable with v2rayNG, which reports
+//! the same quantity the same way -- two keep-alive requests, minimum of the
+//! pair. Same server, same network: ~120 ms on the phone, ~1200 ms here.
 
 use crate::model::{Node, Settings};
 use crate::xray;
 use serde_json::{json, Value};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Concurrent requests. Each is mostly network wait, but every one also drives
-/// an encrypted tunnel, and the router has four cores.
-const WORKERS: usize = 8;
+/// Concurrent probes.
+///
+/// Lowered from eight. Each probe drives a TLS handshake inside the Xray
+/// instance and another in curl, and on an armv7 router with no crypto
+/// acceleration one handshake costs hundreds of milliseconds of CPU. At eight
+/// they queued, and the queueing landed inside the measurement: the same server
+/// read 1200 ms alone and 2270 ms in a crowded sweep. Ranking on that meant
+/// ranking partly on scheduling luck.
+///
+/// Not lowered further, because [`request_through`] now reports the warm
+/// request, and handshakes happen in the discarded first one. Contention still
+/// exists but has mostly moved outside the timed window, so the remaining
+/// reason to keep this small is politeness to a four-core router.
+const WORKERS: usize = 4;
 
 /// Upper bound on nodes measured in one sweep.
 ///
@@ -41,8 +69,14 @@ const WORKERS: usize = 8;
 /// past this is reported as skipped rather than silently dropped.
 pub const MAX_NODES: usize = 120;
 
-/// How long Xray gets to bind every inbound before requests start.
-const STARTUP_GRACE: Duration = Duration::from_millis(700);
+/// Longest wait for Xray to bind every inbound before requests start.
+///
+/// Polled rather than slept through: a fixed wait is either too long on an idle
+/// router or too short on a busy one, and being too short puts startup
+/// contention inside the first measurements.
+const STARTUP_LIMIT: Duration = Duration::from_millis(3000);
+/// Gap between bind checks while waiting.
+const STARTUP_POLL: Duration = Duration::from_millis(40);
 
 #[derive(Debug)]
 pub struct Outcome {
@@ -80,7 +114,7 @@ pub fn measure(
     xray::write_atomic(&path, &body).map_err(|e| format!("cannot write probe config: {e}"))?;
 
     let mut child = Probe::start(&settings.xray_bin, &path)?;
-    thread::sleep(STARTUP_GRACE);
+    wait_for_inbounds(&ports);
 
     let jobs: Vec<(String, u16)> = nodes
         .iter()
@@ -120,6 +154,25 @@ fn reserve_ports(count: usize, base: u16) -> Result<Vec<u16>, String> {
     Err(format!(
         "cannot find {count} free ports near {base}; change the probe port in settings"
     ))
+}
+
+/// Waits until every probe inbound is accepting, or [`STARTUP_LIMIT`] passes.
+///
+/// Giving up quietly is deliberate: a port that never binds belongs to a node
+/// that is about to be reported as failed, which is the honest answer. The
+/// point of waiting is only to keep Xray's startup out of the first
+/// measurements.
+fn wait_for_inbounds(ports: &[u16]) {
+    let deadline = Instant::now() + STARTUP_LIMIT;
+    for port in ports {
+        let addr = SocketAddr::from(([127, 0, 0, 1], *port));
+        while Instant::now() < deadline {
+            if TcpStream::connect_timeout(&addr, STARTUP_POLL).is_ok() {
+                break;
+            }
+            thread::sleep(STARTUP_POLL);
+        }
+    }
 }
 
 /// A config whose only job is to expose one SOCKS port per node.
@@ -171,7 +224,11 @@ impl Probe {
             .stderr(Stdio::null())
             // Keep the measurement from becoming the thing that OOMs the
             // router; this instance is short-lived and carries no real traffic.
-            .env("GOMEMLIMIT", "64MiB");
+            //
+            // Not lower than this. Set tightly it does not save memory, it
+            // buys garbage collection -- and the collector runs inside the
+            // window being timed, on the cores the handshakes need.
+            .env("GOMEMLIMIT", "128MiB");
         xray::set_die_with_parent(&mut cmd);
 
         let child = cmd
@@ -226,27 +283,56 @@ fn run_all(jobs: Vec<(String, u16)>, url: &str, timeout: Duration) -> Vec<(Strin
     results
 }
 
-/// One HTTPS request through a SOCKS port, in milliseconds.
+/// The delay of one request through an *already established* tunnel, in
+/// milliseconds.
 ///
-/// `--socks5-hostname` matters: it hands the *name* to the proxy so the remote
-/// server resolves it. Resolving locally would measure the censor's answer
-/// again, which is the whole thing this module exists to avoid.
+/// The URL is given twice. curl keeps the connection alive between the two
+/// transfers, so the first pays for everything that happens once -- TCP to the
+/// server, the TLS or REALITY handshake, the server's own lookup of the
+/// destination, TCP and TLS to the destination -- and the second is a bare
+/// request over the pipe the first one built. The smaller of the two is
+/// reported.
+///
+/// Measuring the cold number instead was the bug this replaces. The same server
+/// read 1200 ms here and 120 ms on a phone on the same connection, because an
+/// armv7 router with no crypto acceleration spends most of a cold measurement
+/// on handshake arithmetic. That cost belongs to the router, not to the server:
+/// it is identical whichever server is chosen, it swamps the differences
+/// between them, and it varies with how many probes happen to be running. The
+/// ranking was tracking CPU luck rather than path quality.
+///
+/// v2rayNG reports the same quantity, by the same means -- two keep-alive
+/// requests, minimum of the pair -- so the panel's numbers can now be compared
+/// with a phone sitting on the same network.
+///
+/// `--socks5-hostname` matters too: it hands the *name* to the proxy so the
+/// remote server resolves it. Resolving locally would measure the censor's
+/// answer, which is the thing this module exists to avoid.
 fn request_through(port: u16, url: &str, timeout: Duration) -> i32 {
     let out = Command::new("curl")
         .args([
             "--silent",
+            // One per transfer, or curl writes the second body to stdout and
+            // it lands in the middle of the timings.
+            "--output",
+            "/dev/null",
             "--output",
             "/dev/null",
             "--socks5-hostname",
             &format!("127.0.0.1:{port}"),
+            // curl applies this per transfer, and there are two, so half the
+            // caller's budget each keeps a dead node costing what it always
+            // cost. The warm half needs almost none of it; the cold half is
+            // measured at 1.2-2.5 s on this hardware, well inside the share.
             "--max-time",
-            &timeout.as_secs().max(1).to_string(),
+            &(timeout.as_secs().max(2) / 2).to_string(),
             "--proto",
             "=http,https",
             "--write-out",
-            "%{http_code} %{time_total}",
+            "%{http_code} %{time_total}\n",
         ])
         .arg("--")
+        .arg(url)
         .arg(url)
         .stdin(Stdio::null())
         .output();
@@ -254,19 +340,35 @@ fn request_through(port: u16, url: &str, timeout: Duration) -> i32 {
     let Ok(out) = out else {
         return Node::LATENCY_FAILED;
     };
-    if !out.status.success() {
-        return Node::LATENCY_FAILED;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut parts = text.split_whitespace();
-    let code: u32 = parts.next().and_then(|c| c.parse().ok()).unwrap_or(0);
-    let secs: f64 = parts.next().and_then(|t| t.parse().ok()).unwrap_or(0.0);
+    best_attempt(&String::from_utf8_lossy(&out.stdout))
+}
 
-    // Any 2xx/3xx means the request completed end to end. A 4xx/5xx came from
-    // somewhere -- often an interception page -- so it is not a working path.
-    if !(200..400).contains(&code) {
-        return Node::LATENCY_FAILED;
+/// Picks the reportable number out of curl's per-transfer `--write-out` lines.
+///
+/// The exit status is deliberately not consulted. With two URLs curl reports
+/// failure if *either* transfer failed, and a first attempt that fails while
+/// the second succeeds still describes a server that works.
+fn best_attempt(out: &str) -> i32 {
+    let mut best: Option<f64> = None;
+    for line in out.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(code) = parts.next().and_then(|c| c.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(secs) = parts.next().and_then(|t| t.parse::<f64>().ok()) else {
+            continue;
+        };
+        // Any 2xx/3xx means the request completed end to end. A 4xx/5xx came
+        // from somewhere -- often an interception page -- so it is not a
+        // working path.
+        if !(200..400).contains(&code) {
+            continue;
+        }
+        best = Some(best.map_or(secs, |b: f64| b.min(secs)));
     }
+    let Some(secs) = best else {
+        return Node::LATENCY_FAILED;
+    };
     let ms = (secs * 1000.0).round();
     // A real request through a tunnel cannot take zero time; clamping to 1
     // keeps the display honest rather than showing the "0 ms" that a
@@ -333,6 +435,50 @@ mod tests {
         );
         let plain = build_probe_config(&nodes(1), &[24000], false);
         assert!(plain["outbounds"][0]["streamSettings"].get("sockopt").is_none());
+    }
+
+    /// The whole point of the change: the cold attempt is a warm-up, and the
+    /// number that reaches the panel is the one that travelled an established
+    /// tunnel. Reporting 1204 here would be reporting the router's CPU.
+    #[test]
+    fn the_warm_attempt_is_what_gets_reported() {
+        assert_eq!(best_attempt("204 1.204312\n204 0.128687\n"), 129);
+    }
+
+    /// curl exits non-zero if *either* transfer failed, which is why the exit
+    /// status is ignored. A server whose second request works, works.
+    #[test]
+    fn a_failed_first_attempt_does_not_condemn_a_working_second() {
+        assert_eq!(best_attempt("000 4.000000\n204 0.131000\n"), 131);
+    }
+
+    #[test]
+    fn no_successful_attempt_is_a_failure() {
+        assert_eq!(best_attempt("000 4.000000\n000 4.000000\n"), Node::LATENCY_FAILED);
+        assert_eq!(best_attempt(""), Node::LATENCY_FAILED);
+        assert_eq!(best_attempt("garbage\n"), Node::LATENCY_FAILED);
+    }
+
+    /// A captive portal or a block page answers, but it is not the destination.
+    #[test]
+    fn an_error_status_is_not_a_working_path() {
+        assert_eq!(best_attempt("403 0.090000\n403 0.020000\n"), Node::LATENCY_FAILED);
+        // ...and a bad status must not drag the reported minimum down either.
+        assert_eq!(best_attempt("503 0.010000\n204 0.140000\n"), 140);
+    }
+
+    /// Zero milliseconds is what the old TCP-handshake test reported against
+    /// interception boxes. Nothing real is instant.
+    #[test]
+    fn a_sub_millisecond_result_is_clamped_not_shown_as_zero() {
+        assert_eq!(best_attempt("204 0.000200\n"), 1);
+    }
+
+    /// Both transfers must be given their own sink, or the second body is
+    /// written to stdout and lands between the timing lines.
+    #[test]
+    fn curl_gets_one_output_sink_per_transfer() {
+        assert_eq!(best_attempt("204 1.200000\n<!doctype html>\n204 0.130000\n"), 130);
     }
 
     #[test]
