@@ -267,8 +267,12 @@ pub struct Settings {
     /// Xray's TPROXY inbound port.
     #[serde(default = "d_tproxy_port")]
     pub tproxy_port: u16,
-    /// Comma-separated interfaces to intercept, e.g. `br-lan`.
-    #[serde(default = "d_lan_interfaces")]
+    /// Comma-separated interfaces to intercept.
+    ///
+    /// Empty means discover them from the router, which is the default and the
+    /// portable answer: `br-lan` is an OpenWrt convention, and a device with a
+    /// guest network or VLANs has other names that would silently never match.
+    #[serde(default)]
     pub lan_interfaces: String,
     /// Tunnel IPv6 as well as IPv4. Off by default -- the router's current
     /// Passwall2 setup leaves IPv6 direct, and matching that avoids a surprise.
@@ -287,12 +291,13 @@ pub struct Settings {
     #[serde(default = "d_probe_base_port")]
     pub probe_base_port: u16,
     /// Resolver used for the proxy servers' own hostnames, queried directly
-    /// rather than through the tunnel.
+    /// rather than through the tunnel. Empty means use the router's own
+    /// upstream, which works on networks where a fixed public resolver does not.
     ///
     /// Required to break the resolution deadlock: with `no-resolv`, dnsmasq's
     /// only upstream is Xray, and Xray cannot answer until it has connected to
     /// a server whose address it cannot resolve. See [`crate::dnsmasq::install`].
-    #[serde(default = "d_bypass_resolver")]
+    #[serde(default)]
     pub dns_bypass_resolver: String,
     /// Also tunnel the router's own outbound traffic -- package updates, NTP,
     /// LuCI's own requests. Passwall2 calls this `localhost_proxy`.
@@ -339,16 +344,12 @@ fn d_dns_port() -> u16 {
 fn d_test_target() -> String {
     "google".into()
 }
-fn d_bypass_resolver() -> String {
-    "1.1.1.1".into()
-}
+
 /// High and unremarkable; only ever bound on loopback and only during a sweep.
 fn d_probe_base_port() -> u16 {
     24000
 }
-fn d_lan_interfaces() -> String {
-    "br-lan".into()
-}
+
 
 /// The three ways traffic can reach the tunnel.
 pub const MODES: &[&str] = &["off", "proxy", "global"];
@@ -359,14 +360,34 @@ impl Settings {
         self.mode != "off"
     }
 
-    /// LAN interfaces as a list, blanks removed.
+    /// LAN interfaces as a list, discovered when not set explicitly.
     pub fn lan_list(&self) -> Vec<String> {
-        self.lan_interfaces
+        let explicit: Vec<String> = self
+            .lan_interfaces
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(String::from)
-            .collect()
+            .collect();
+        if explicit.is_empty() {
+            crate::discover::lan_interfaces()
+        } else {
+            explicit
+        }
+    }
+
+    /// Resolver for the proxy servers' own hostnames, discovered when not set.
+    pub fn bypass_resolver(&self) -> String {
+        let explicit = self.dns_bypass_resolver.trim();
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+        crate::discover::upstream_resolvers()
+            .first()
+            .map(|ip| ip.to_string())
+            // Only if the router itself has no usable upstream, which on a
+            // working connection it always does.
+            .unwrap_or_else(|| "1.1.1.1".into())
     }
 }
 
@@ -389,13 +410,13 @@ impl Default for Settings {
             sniff_route_only: true,
             transparent: false,
             tproxy_port: d_tproxy_port(),
-            lan_interfaces: d_lan_interfaces(),
+            lan_interfaces: String::new(),
             tunnel_ipv6: false,
             dns_port: d_dns_port(),
             mode: "proxy".into(),
             route_router_traffic: false,
             dns_redirect: true,
-            dns_bypass_resolver: d_bypass_resolver(),
+            dns_bypass_resolver: String::new(),
             test_target: d_test_target(),
             test_url_custom: String::new(),
             probe_base_port: d_probe_base_port(),

@@ -1,0 +1,50 @@
+#!/bin/sh
+# Reacts to the WAN coming back.
+#
+# When the upstream link re-establishes -- a PPPoE redial, a DHCP renewal, a
+# wifi client reassociating -- every connection Xray held is dead, and it will
+# sit there with broken sockets until something tells it otherwise. Nothing
+# does, because the daemon has no reason to suspect the network moved
+# underneath it.
+#
+# Modelled on Passwall2's /etc/hotplug.d/iface/98-passwall2: act only when the
+# interface that changed is the one carrying the default route, take a light
+# path for an address change and a full one for a link coming up, and hold a
+# lock so a flapping link cannot start several restarts at once.
+
+[ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || exit 0
+
+STATE=/etc/xrayop/state.json
+[ -f "$STATE" ] || exit 0
+
+# Only the WAN matters. Identified by the default route rather than by the name
+# "wan", which is a convention: it can be wwan, a modem, or several of them.
+default_device=$(ip -4 route show default 2>/dev/null | awk -F 'dev ' '{print $2}' | awk '{print $1}' | head -n1)
+default6_device=$(ip -6 route show default 2>/dev/null | awk -F 'dev ' '{print $2}' | awk '{print $1}' | head -n1)
+[ "$default_device" = "$DEVICE" ] || [ "$default6_device" = "$DEVICE" ] || exit 0
+
+# A flapping link fires this repeatedly; one restart at a time is enough.
+LOCK=/var/run/xrayop-hotplug.lock
+if [ -s "$LOCK" ]; then
+    pid=$(cat "$LOCK" 2>/dev/null)
+    [ -n "$pid" ] && [ -e "/proc/$pid" ] && exit 0
+fi
+mkdir -p /var/run
+echo $$ > "$LOCK"
+
+TOKEN=$(sed -n 's/.*"panel_token": "\([^"]*\)".*/\1/p' "$STATE")
+PORT=$(uci -q get xrayop.main.listen | sed 's/.*://')
+[ -n "$PORT" ] || PORT=8088
+
+# Ask the daemon rather than restarting the service: it knows whether the
+# tunnel is even meant to be running, and a restart would drop the panel too.
+if [ -n "$TOKEN" ]; then
+    curl -s --max-time 20 \
+        -H "X-Xrayop-Token: $TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"event\":\"$ACTION\"}" \
+        "http://127.0.0.1:$PORT/api/network-changed" >/dev/null 2>&1
+    logger -t xrayop "reacting to $ACTION on $DEVICE (the default route)"
+fi
+
+rm -f "$LOCK"

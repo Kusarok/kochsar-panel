@@ -136,7 +136,7 @@ impl App {
             tunnel_ipv6: s.tunnel_ipv6,
             dns_redirect: s.dns_redirect,
             route_router_traffic: s.route_router_traffic,
-            dns_bypass_resolver: s.dns_bypass_resolver.parse().ok(),
+            dns_bypass_resolver: s.bypass_resolver().parse().ok(),
         }
     }
 

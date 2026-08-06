@@ -128,6 +128,7 @@ fn dispatch(app: &Arc<Mutex<App>>, mut request: Request) {
                 "/api/tproxy/disable" => handle_tproxy_disable(app),
                 "/api/nodes/restore" => handle_restore(app),
                 "/api/mode" => handle_mode(app, &body),
+                "/api/network-changed" => handle_network_changed(app, &body),
                 _ => error(404, "no such endpoint"),
             },
         },
@@ -222,6 +223,9 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
             "now": xray::now_secs(),
             "port": state.settings.tproxy_port,
             "interfaces": state.settings.lan_list(),
+            "interfaces_auto": state.settings.lan_interfaces.trim().is_empty(),
+            "bypass_resolver": state.settings.bypass_resolver(),
+            "bypass_resolver_auto": state.settings.dns_bypass_resolver.trim().is_empty(),
             "tunnel_ipv6": state.settings.tunnel_ipv6,
         }
     }))
@@ -484,7 +488,7 @@ fn reapply_rules(app: &Arc<Mutex<App>>) {
             a.tproxy_plan(ips),
             a.state.settings.dns_port,
             a.server_hostnames(),
-            a.state.settings.dns_bypass_resolver.clone(),
+            a.state.settings.bypass_resolver(),
         )
     };
     if let Err(e) = tproxy::apply(&plan) {
@@ -564,23 +568,26 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
     }
     if let Some(raw) = body.get("lan_interfaces") {
         let v = raw.as_str().unwrap_or_default().trim();
+        // Empty is meaningful here: it hands the choice back to discovery
+        // rather than being a validation failure.
         if v.is_empty() {
-            return Err("at least one LAN interface is required".into());
-        }
+            next.lan_interfaces = String::new();
+        } else {
         // This string is interpolated straight into an nftables script that is
         // fed to `nft -f` as root. A quote, brace or newline here would escape
         // the intended rule -- and since `disable` only deletes our own table,
         // an injected second table would outlive it.
-        for name in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let ok = name.len() <= 15
-                && name
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-            if !ok {
-                return Err(format!("{name:?} is not a valid interface name"));
+            for name in v.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let ok = name.len() <= 15
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                if !ok {
+                    return Err(format!("{name:?} is not a valid interface name"));
+                }
             }
+            next.lan_interfaces = v.to_string();
         }
-        next.lan_interfaces = v.to_string();
     }
     if let Some(raw) = body.get("go_mem_limit_mb") {
         let v = raw.as_u64().ok_or("go_mem_limit_mb must be a number")?;
@@ -628,13 +635,18 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
     }
     if let Some(raw) = body.get("dns_bypass_resolver") {
         let v = raw.as_str().unwrap_or_default().trim();
-        // Must be a plain address: this one is queried directly, outside the
-        // tunnel, so a DoH URL here would need its own name resolved first and
-        // reintroduce the deadlock it exists to prevent.
-        if v.parse::<std::net::IpAddr>().is_err() {
-            return Err("the bypass resolver must be a plain IP address".into());
+        // Empty hands it back to discovery: the router's own upstream.
+        if v.is_empty() {
+            next.dns_bypass_resolver = String::new();
+        } else {
+            // Must be a plain address: this one is queried directly, outside
+            // the tunnel, so a DoH URL here would need its own name resolved
+            // first and reintroduce the deadlock it exists to prevent.
+            if v.parse::<std::net::IpAddr>().is_err() {
+                return Err("the bypass resolver must be a plain IP address".into());
+            }
+            next.dns_bypass_resolver = v.to_string();
         }
-        next.dns_bypass_resolver = v.to_string();
     }
     if let Some(raw) = body.get("probe_base_port") {
         next.probe_base_port = port_of(raw).ok_or("probe_base_port must be between 1 and 65535")?;
@@ -672,6 +684,47 @@ fn handle_service(app: &Arc<Mutex<App>>, body: &Value) -> Body {
         }
         other => error(400, &format!("unknown action {other:?}")),
     }
+}
+
+/// The WAN came back. Called by the hotplug script.
+///
+/// Two different events, two different weights, following Passwall2's split:
+/// `ifupdate` is an address change on a link that stayed up, so the rules need
+/// refreshing but the core's connections are probably fine. `ifup` means the
+/// link went away and returned, and everything Xray held is dead -- it has to
+/// reconnect, and it will not work that out on its own.
+fn handle_network_changed(app: &Arc<Mutex<App>>, body: &Value) -> Body {
+    let event = str_field(body, "event");
+    let (enabled, transparent) = {
+        let a = lock(app);
+        (a.state.settings.core_enabled(), a.state.settings.transparent)
+    };
+    if !enabled {
+        return json_ok(json!({ "ok": true, "action": "none" }));
+    }
+
+    // A link that just came back needs the core restarted; its sockets point
+    // at a route that no longer exists.
+    if event != "ifupdate" {
+        let mut a = lock(app);
+        let state = a.state.clone();
+        match a.sup.apply(&state) {
+            Ok(()) => a.health.restarts += 1,
+            Err(e) => {
+                a.health.last_failure = e.clone();
+                drop(a);
+                return error(500, &format!("could not restart xray after {event}: {e}"));
+            }
+        }
+    }
+
+    // The server may resolve somewhere new on the other side of a reconnect,
+    // and the bypass set has to follow or Xray's own traffic gets intercepted.
+    if transparent {
+        reapply_rules(app);
+    }
+
+    json_ok(json!({ "ok": true, "action": event, "transparent": transparent }))
 }
 
 /// Switches between off / proxy / global.
@@ -797,7 +850,7 @@ fn handle_tproxy_enable(app: &Arc<Mutex<App>>) -> Body {
         (
             a.state.settings.dns_port,
             a.server_hostnames(),
-            a.state.settings.dns_bypass_resolver.clone(),
+            a.state.settings.bypass_resolver(),
         )
     };
     if let Err(e) = dnsmasq::install(dns_port, &bypass, &resolver) {

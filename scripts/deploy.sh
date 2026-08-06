@@ -32,6 +32,9 @@ if [ "${1:-}" != "--bin" ]; then
   # Never clobber an existing config -- it holds the user's chosen port.
   ssh "$ROUTER" '[ -f /etc/config/xrayop ] || cat > /etc/config/xrayop' \
     < "$here/openwrt/etc/config/xrayop"
+  # Reacts to the WAN coming back; without it a reconnect leaves xray holding
+  # dead sockets until something else restarts it.
+  ssh "$ROUTER" 'mkdir -p /etc/hotplug.d/iface && cat > /etc/hotplug.d/iface/99-xrayop && chmod +x /etc/hotplug.d/iface/99-xrayop'     < "$here/openwrt/etc/hotplug.d/iface/99-xrayop"
   ssh "$ROUTER" '/etc/init.d/xrayop enable'
 fi
 

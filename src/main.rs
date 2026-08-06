@@ -8,6 +8,7 @@
 //! * [`probe`]  -- name resolution helpers
 //! * [`latency`] -- real-delay measurement through each server
 //! * [`dnscfg`] -- DNS presets
+//! * [`discover`] -- reading the router's real network layout
 //! * [`dnsmasq`] -- pointing the LAN resolver at Xray
 //! * [`health`]  -- keeping the core alive, and unwinding when it cannot be
 //! * [`xray`]   -- config generation and process supervision
@@ -20,6 +21,7 @@
 
 mod api;
 mod dnscfg;
+mod discover;
 mod dnsmasq;
 mod health;
 mod latency;
@@ -111,6 +113,22 @@ fn main() -> ExitCode {
         );
     }
 
+    // First run: point at whatever xray this router actually has, rather than
+    // leaving the default and failing on a device that installed it elsewhere.
+    if !std::path::Path::new(&app.state.settings.xray_bin).exists() {
+        if let Some(found) = discover::xray_binary() {
+            eprintln!("xrayopd: xray found at {found}");
+            app.state.settings.xray_bin = found;
+            let _ = app.save();
+        }
+    }
+
+    println!(
+        "xrayopd: LAN interfaces {:?}, bypass resolver {}",
+        app.state.settings.lan_list(),
+        app.state.settings.bypass_resolver()
+    );
+
     // Restore the previous session. A failure here is reported but not fatal --
     // the panel is how the user would fix a bad node or a missing binary, so it
     // must come up either way.
@@ -144,7 +162,7 @@ fn main() -> ExitCode {
         }
         // The drop-in lives on tmpfs, so a reboot removed it; put it back.
         let bypass = app.server_hostnames();
-        let resolver = app.state.settings.dns_bypass_resolver.clone();
+        let resolver = app.state.settings.bypass_resolver();
         match dnsmasq::install(app.state.settings.dns_port, &bypass, &resolver) {
             Ok(()) => app.dns_via_tunnel = true,
             Err(e) => eprintln!("xrayopd: could not restore tunnelled DNS: {e}"),
@@ -312,7 +330,7 @@ fn dump_ruleset(state_path: &std::path::Path, check: bool) -> Result<(), String>
         tunnel_ipv6: s.tunnel_ipv6,
         dns_redirect: s.dns_redirect,
         route_router_traffic: s.route_router_traffic,
-        dns_bypass_resolver: s.dns_bypass_resolver.parse().ok(),
+        dns_bypass_resolver: s.bypass_resolver().parse().ok(),
     };
 
     print!("{}", tproxy::build_ruleset(&plan));

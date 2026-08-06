@@ -188,7 +188,7 @@ fn restore_rules(app: &Arc<Mutex<App>>) {
             a.tproxy_plan(ips),
             a.state.settings.dns_port,
             a.server_hostnames(),
-            a.state.settings.dns_bypass_resolver.clone(),
+            a.state.settings.bypass_resolver(),
         )
     };
 
