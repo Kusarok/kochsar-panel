@@ -195,6 +195,22 @@ pub struct Settings {
     pub xray_bin: String,
     pub log_level: String,
 
+    // --- logging ---
+    //
+    // The log lives on tmpfs, which is RAM. On a 512MB router an unbounded log
+    // at loglevel info is a slow out-of-memory, so it is off by default and
+    // bounded twice over when on: by size and by age.
+    /// Write Xray's output to a file at all. Off means Xray runs with
+    /// `loglevel: none` and its output goes to `/dev/null` -- no file exists.
+    #[serde(default)]
+    pub log_enabled: bool,
+    /// Truncate once the log passes this size.
+    #[serde(default = "d_log_max_kb")]
+    pub log_max_kb: u64,
+    /// Truncate at least this often, even if the size cap is never reached.
+    #[serde(default = "d_log_rotate_secs")]
+    pub log_rotate_secs: u64,
+
     // --- transparent proxy ---
     /// Intercept LAN traffic instead of requiring clients to set a proxy.
     /// Off by default: enabling it rewrites the router's packet path.
@@ -214,6 +230,14 @@ pub struct Settings {
 
 fn d_tproxy_port() -> u16 {
     12345
+}
+/// 256 KB of tmpfs is a rounding error against 512 MB of RAM, and still holds
+/// several thousand lines -- far more than anyone reads when debugging.
+fn d_log_max_kb() -> u64 {
+    256
+}
+fn d_log_rotate_secs() -> u64 {
+    120
 }
 fn d_lan_interfaces() -> String {
     "br-lan".into()
@@ -241,6 +265,9 @@ impl Default for Settings {
             dns_custom: String::new(),
             xray_bin: "/usr/bin/xray".into(),
             log_level: "warning".into(),
+            log_enabled: false,
+            log_max_kb: d_log_max_kb(),
+            log_rotate_secs: d_log_rotate_secs(),
             transparent: false,
             tproxy_port: d_tproxy_port(),
             lan_interfaces: d_lan_interfaces(),

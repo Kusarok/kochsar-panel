@@ -28,6 +28,10 @@ mod xray;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+
+use store::App;
 
 const DEFAULT_LISTEN: &str = "0.0.0.0:8088";
 const DEFAULT_STATE: &str = "/etc/xrayop/state.json";
@@ -111,6 +115,8 @@ fn main() -> ExitCode {
     );
 
     let app = Arc::new(Mutex::new(app));
+    spawn_log_janitor(Arc::clone(&app));
+
     if let Err(e) = api::serve(app, &args.listen, WORKERS) {
         eprintln!("xrayopd: {e}");
         return ExitCode::FAILURE;
@@ -155,6 +161,36 @@ fn parse_args() -> Result<Option<Args>, String> {
         state: PathBuf::from(state),
         runtime: PathBuf::from(runtime),
     }))
+}
+
+/// How often the janitor wakes. Well under the smallest sensible rotation
+/// interval, so the size cap is enforced promptly rather than at the next
+/// rotation boundary -- a burst of logging can blow past the cap in seconds.
+const JANITOR_TICK: Duration = Duration::from_secs(15);
+
+/// Keeps Xray's log from filling tmpfs.
+///
+/// The log lives in RAM. Left alone at `loglevel: info`, a busy LAN fills it
+/// faster than anyone would notice, and the router runs out of memory long
+/// before anyone thinks to look at a log file. One thread, asleep almost all
+/// the time, is cheap insurance.
+fn spawn_log_janitor(app: Arc<Mutex<App>>) {
+    thread::spawn(move || loop {
+        thread::sleep(JANITOR_TICK);
+
+        // Take the settings and drop the lock before touching the filesystem.
+        let Ok(mut guard) = app.lock().or_else(|e| Ok::<_, ()>(e.into_inner())) else {
+            return;
+        };
+        let s = &guard.state.settings;
+        if !s.log_enabled {
+            continue;
+        }
+        let max_bytes = s.log_max_kb.saturating_mul(1024);
+        let max_age = Duration::from_secs(s.log_rotate_secs.max(10));
+        guard.sup.tidy_log(max_bytes, max_age);
+        drop(guard);
+    });
 }
 
 /// Renders the transparent-proxy ruleset from saved settings, optionally

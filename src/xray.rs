@@ -3,7 +3,7 @@
 use crate::dnscfg;
 use crate::model::{Node, State};
 use serde_json::{json, Map, Value};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -93,8 +93,17 @@ pub fn build_config(state: &State) -> Option<Value> {
         { "tag": "block", "protocol": "blackhole", "settings": {} }
     ]);
 
+    // With logging off, tell Xray not to produce lines at all rather than
+    // producing them and discarding them -- formatting them costs CPU on a
+    // router that has little to spare.
+    let loglevel = if s.log_enabled {
+        s.log_level.as_str()
+    } else {
+        "none"
+    };
+
     Some(json!({
-        "log": { "loglevel": s.log_level },
+        "log": { "loglevel": loglevel },
         "dns": build_dns(state),
         "inbounds": inbounds,
         "outbounds": outbounds,
@@ -293,6 +302,8 @@ pub struct Supervisor {
     pub started_at: u64,
     /// Node id the running process was built for.
     pub running_node: String,
+    /// When the log was last emptied, for the age-based cap.
+    log_rotated_at: Instant,
 }
 
 impl Supervisor {
@@ -303,7 +314,35 @@ impl Supervisor {
             last_error: String::new(),
             started_at: 0,
             running_node: String::new(),
+            log_rotated_at: Instant::now(),
         }
+    }
+
+    /// Empties the log once it is too big or too old.
+    ///
+    /// Called from a background thread. Both caps exist for different reasons:
+    /// size is what actually protects the router's RAM, age is what stops a
+    /// slow trickle of lines sitting around for days. Returns whether it
+    /// truncated, so the caller can log the event once rather than per tick.
+    pub fn tidy_log(&mut self, max_bytes: u64, max_age: Duration) -> bool {
+        let Ok(meta) = fs::metadata(&self.paths.log) else {
+            return false; // no log file: logging is off, nothing to do
+        };
+        if meta.len() == 0 {
+            return false;
+        }
+        let too_big = meta.len() > max_bytes;
+        let too_old = self.log_rotated_at.elapsed() >= max_age;
+        if !(too_big || too_old) {
+            return false;
+        }
+        // Truncates the inode Xray is holding. Safe because that handle is
+        // O_APPEND -- see the comment in `apply`.
+        if File::create(&self.paths.log).is_ok() {
+            self.log_rotated_at = Instant::now();
+            return true;
+        }
+        false
     }
 
     /// True if the child is alive. Reaps it if it has exited.
@@ -354,22 +393,35 @@ impl Supervisor {
             return Err(msg);
         }
 
-        // Truncate rather than append: the log is a debugging aid, and an
-        // unbounded file on tmpfs would eat the router's RAM.
-        let log = File::create(&self.paths.log)
-            .map_err(|e| format!("cannot open {}: {e}", self.paths.log.display()))?;
-        let log_err = log
-            .try_clone()
-            .map_err(|e| format!("cannot duplicate log handle: {e}"))?;
-
         let mut cmd = Command::new(bin);
         cmd.arg("run")
             .arg("-c")
             .arg(&self.paths.config)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(log_err));
+            .stdin(Stdio::null());
         set_die_with_parent(&mut cmd);
+
+        if state.settings.log_enabled {
+            // O_APPEND is load-bearing, not a style choice. The janitor
+            // truncates this file while Xray holds it open; without O_APPEND
+            // the child keeps writing at its old offset and the "truncated"
+            // file immediately becomes a sparse file that reports the old
+            // size. With it, every write seeks to the real end first.
+            let log = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.paths.log)
+                .map_err(|e| format!("cannot open {}: {e}", self.paths.log.display()))?;
+            let log_err = log
+                .try_clone()
+                .map_err(|e| format!("cannot duplicate log handle: {e}"))?;
+            cmd.stdout(Stdio::from(log)).stderr(Stdio::from(log_err));
+        } else {
+            // Nothing is written anywhere. `build_config` also forces
+            // `loglevel: none`, so Xray does not even format the lines.
+            let _ = fs::remove_file(&self.paths.log);
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        self.log_rotated_at = Instant::now();
 
         let child = cmd.spawn().map_err(|e| format!("cannot start xray: {e}"))?;
 
@@ -670,6 +722,88 @@ mod tests {
         let s = state_with("vless://uu@ex.com:443?type=tcp#n");
         let cfg = build_config(&s).unwrap();
         assert!(cfg["outbounds"][0]["streamSettings"].get("sockopt").is_none());
+    }
+
+    #[test]
+    fn logging_off_forces_loglevel_none() {
+        let s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        assert!(!s.settings.log_enabled, "logging must default to off on a router");
+        assert_eq!(build_config(&s).unwrap()["log"]["loglevel"], "none");
+    }
+
+    #[test]
+    fn logging_on_uses_the_chosen_level() {
+        let mut s = state_with("vless://uu@ex.com:443?type=tcp#n");
+        s.settings.log_enabled = true;
+        s.settings.log_level = "debug".into();
+        assert_eq!(build_config(&s).unwrap()["log"]["loglevel"], "debug");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tidy_log_enforces_the_size_cap() {
+        let dir = scratch("tidy-size");
+        let mut sup = Supervisor::new(Paths::new(&dir));
+        let log = dir.join("xray.log");
+        fs::write(&log, vec![b'x'; 4096]).unwrap();
+
+        // Under the cap and freshly rotated: nothing to do.
+        assert!(!sup.tidy_log(8192, Duration::from_secs(3600)));
+        assert_eq!(fs::metadata(&log).unwrap().len(), 4096);
+
+        // Over the cap: emptied.
+        assert!(sup.tidy_log(1024, Duration::from_secs(3600)));
+        assert_eq!(fs::metadata(&log).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tidy_log_enforces_the_age_cap() {
+        let dir = scratch("tidy-age");
+        let mut sup = Supervisor::new(Paths::new(&dir));
+        fs::write(dir.join("xray.log"), b"some lines\n").unwrap();
+
+        // A zero max_age makes every call overdue, standing in for elapsed time.
+        assert!(sup.tidy_log(u64::MAX, Duration::from_secs(0)));
+        assert_eq!(fs::metadata(dir.join("xray.log")).unwrap().len(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tidy_log_is_a_no_op_without_a_log() {
+        let dir = scratch("tidy-none");
+        let mut sup = Supervisor::new(Paths::new(&dir));
+        let _ = fs::remove_file(dir.join("xray.log"));
+        assert!(!sup.tidy_log(0, Duration::from_secs(0)), "no file, nothing to rotate");
+    }
+
+    /// Truncating a file the child holds open only works if that handle is
+    /// O_APPEND; otherwise the child writes at its old offset and recreates
+    /// the size as a sparse hole. This asserts the behaviour we depend on.
+    #[cfg(unix)]
+    #[test]
+    fn appending_after_truncation_restarts_at_zero() {
+        use std::io::Write as _;
+
+        let dir = scratch("tidy-append");
+        let path = dir.join("append-probe.log");
+        let mut holder = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        holder.write_all(&vec![b'x'; 5000]).unwrap();
+        holder.flush().unwrap();
+
+        File::create(&path).unwrap(); // truncate underneath the open handle
+        holder.write_all(b"after").unwrap();
+        holder.flush().unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().len(),
+            5,
+            "with O_APPEND the file restarts at zero; without it this would be 5005"
+        );
     }
 
     #[test]

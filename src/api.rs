@@ -373,6 +373,35 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
         }
         next.log_level = v.to_string();
     }
+    if let Some(raw) = body.get("log_enabled") {
+        next.log_enabled = raw.as_bool().ok_or("log_enabled must be true or false")?;
+    }
+    if let Some(raw) = body.get("log_max_kb") {
+        let v = raw.as_u64().ok_or("log_max_kb must be a number")?;
+        // The log lives in RAM. An upper bound here is what stops a typo in
+        // the panel from turning into an out-of-memory on the router.
+        if !(16..=4096).contains(&v) {
+            return Err("log size cap must be between 16 and 4096 KB".into());
+        }
+        next.log_max_kb = v;
+    }
+    if let Some(raw) = body.get("log_rotate_secs") {
+        let v = raw.as_u64().ok_or("log_rotate_secs must be a number")?;
+        if !(10..=3600).contains(&v) {
+            return Err("log rotation must be between 10 and 3600 seconds".into());
+        }
+        next.log_rotate_secs = v;
+    }
+    if let Some(raw) = body.get("transparent_ipv6") {
+        next.tunnel_ipv6 = raw.as_bool().ok_or("transparent_ipv6 must be true or false")?;
+    }
+    if let Some(raw) = body.get("lan_interfaces") {
+        let v = raw.as_str().unwrap_or_default().trim();
+        if v.is_empty() {
+            return Err("at least one LAN interface is required".into());
+        }
+        next.lan_interfaces = v.to_string();
+    }
 
     if next.socks_port == next.http_port {
         return Err("SOCKS and HTTP ports must differ".into());
