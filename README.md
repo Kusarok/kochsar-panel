@@ -3,12 +3,14 @@
 A small Xray manager for OpenWrt routers, with a browser panel that behaves like
 v2rayNG: paste a subscription, test latency, tap a server, done.
 
-Written in Rust. The daemon is a **751 KB static binary** using **808 KB of RAM**
-on the target router.
+Written in Rust. The daemon is a **~870 KB static binary** using **under 1 MB of
+RAM** on the target router; the whole stack measured 38.6 MB against Passwall2's
+51.2 MB carrying the same traffic.
 
-> **Status: working prototype.** It runs a SOCKS5 and an HTTP proxy that clients
-> point at explicitly. It does **not** yet do transparent proxying, so it is not
-> a Passwall2 replacement until that lands. See [Roadmap](#roadmap).
+> **Status: working, not yet battle-tested.** The SOCKS/HTTP path is in daily
+> use. Transparent proxying and tunnelled DNS are written, kernel-validated and
+> wired to the panel, but have **never been applied to a live router** — the
+> first enable should happen with physical access to the device.
 
 ---
 
@@ -39,13 +41,19 @@ cycle, and the UI is whatever we want it to be rather than whatever CBI renders.
   that dies on startup is reported as a failure with the reason, not silently
   shown as connected.
 
+- **Transparent proxy** — nftables TPROXY for the LAN, with tunnelled DNS, an
+  apply-then-confirm handshake and an automatic rollback. Written and validated;
+  see the section below before enabling it.
+
 ## What it does not do yet
 
-- No transparent proxy. Clients must be pointed at the SOCKS or HTTP port; LAN
-  traffic is not intercepted.
+- The router's **own** outbound traffic is not intercepted — only LAN clients.
+- IPv6 is left direct.
 - VLESS only. VMess, Trojan, Shadowsocks and Hysteria links are counted as
   "unsupported" on import rather than parsed.
-- Latency is a TCP handshake, not end-to-end proxy delay.
+- Rules are not re-applied automatically after `fw4 reload`; the panel detects
+  the drift and says so, but reinstating them is manual.
+
 ---
 
 ## Measuring latency
