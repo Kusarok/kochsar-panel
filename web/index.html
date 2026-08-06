@@ -1055,7 +1055,7 @@ function renderSettings() {
   kv(t("socksAt"), host + ":" + s.socks_port);
   kv(t("httpAt"), host + ":" + s.http_port);
   kv(t("state"), st_path());
-  kv(t("version"), "kochsar 0.1.0");
+  kv(t("version"), "kochsar " + (state.status.version || "?"));
 }
 function st_path() { return state.status.config_path.replace(/\/config\.json$/, ""); }
 

@@ -205,6 +205,10 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
             "running_node": app.sup.running_node,
             "last_error": app.sup.last_error,
             "config_path": app.sup.config_path().display().to_string(),
+            // Sent so the panel does not carry its own copy of the version.
+            // Cargo.toml is the only place it is written; the release tarball
+            // takes its name from there too.
+            "version": env!("CARGO_PKG_VERSION"),
         },
         "health": {
             "restarts": health.restarts,
@@ -1504,6 +1508,24 @@ mod tests {
     /// This checks the shape that broke rather than trying to parse JS. Real
     /// parsing happens in `scripts/build.sh`, which runs `node --check` when
     /// node is available.
+    /// The panel used to print `"kochsar 0.1.0"` from a literal in the HTML,
+    /// which is a second place the version is written and so a second place it
+    /// can be wrong. Cargo.toml is the only source: the binary reads it through
+    /// `CARGO_PKG_VERSION`, the release tarball takes its name from it, and the
+    /// panel now receives it in `/api/state`.
+    #[test]
+    fn the_panel_does_not_carry_its_own_version_number() {
+        let current = env!("CARGO_PKG_VERSION");
+        assert!(
+            !INDEX_HTML.contains(current),
+            "the panel hard-codes version {current}; it must read status.version instead"
+        );
+        assert!(
+            INDEX_HTML.contains("status.version"),
+            "the panel must show the version the daemon reports"
+        );
+    }
+
     #[test]
     fn panel_has_no_unterminated_string_literals() {
         let script = INDEX_HTML
