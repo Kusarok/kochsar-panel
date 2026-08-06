@@ -574,10 +574,10 @@ mod tests {
     #[test]
     fn manual_import_reports_bad_lines() {
         let mut app = app();
-        let s = app.add_nodes_from_text(&format!("{A}\nvless://broken\ntrojan://x@h:1#t"));
+        let s = app.add_nodes_from_text(&format!("{A}\nvless://broken\nwireguard://k@h:1#w"));
         assert_eq!(s.imported, 1);
         assert_eq!(s.errors.len(), 1);
-        assert_eq!(s.skipped, 1);
+        assert_eq!(s.skipped, 1, "wireguard is not spoken yet");
     }
 
     fn app_at(dir: &std::path::Path) -> App {

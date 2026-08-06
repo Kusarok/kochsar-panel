@@ -240,14 +240,8 @@ pub fn probe_outbound(node: &Node, tag: &str, marked: bool) -> Value {
     }
     json!({
         "tag": tag,
-        "protocol": "vless",
-        "settings": {
-            "vnext": [{
-                "address": node.server,
-                "port": node.port,
-                "users": [build_user(node)]
-            }]
-        },
+        "protocol": protocol_name(node),
+        "settings": build_settings(node),
         "streamSettings": stream
     })
 }
@@ -261,16 +255,73 @@ fn build_outbound(node: &Node, transparent: bool) -> Value {
     }
     json!({
         "tag": "proxy",
-        "protocol": "vless",
-        "settings": {
+        "protocol": protocol_name(node),
+        "settings": build_settings(node),
+        "streamSettings": stream
+    })
+}
+
+/// The outbound protocol Xray should load. Anything unrecognised is treated as
+/// VLESS, which is what a node parsed before `protocol` existed will be.
+fn protocol_name(node: &Node) -> &str {
+    match node.protocol.as_str() {
+        "vmess" => "vmess",
+        "trojan" => "trojan",
+        "shadowsocks" => "shadowsocks",
+        _ => "vless",
+    }
+}
+
+/// The `settings` object, whose shape is per-protocol.
+///
+/// VLESS and VMess address a server through `vnext` with a user account;
+/// Trojan and Shadowsocks through `servers` with a password on the server
+/// itself. Both forms take exactly one entry -- Xray rejects more.
+///
+/// `level` stays 0 on purpose. It selects the policy bucket, and only level 0
+/// is defined in the config this builds, so any other value would silently
+/// fall back to Xray's default 300-second idle timeout and discard the
+/// `conn_idle_secs` setting. v2rayNG writes 8 here and loses exactly that.
+fn build_settings(node: &Node) -> Value {
+    match protocol_name(node) {
+        "vmess" => json!({
+            "vnext": [{
+                "address": node.server,
+                "port": node.port,
+                "users": [{
+                    "id": node.uuid,
+                    "security": non_empty(&node.method, "auto"),
+                    "level": 0
+                }]
+            }]
+        }),
+        "trojan" => json!({
+            "servers": [{
+                "address": node.server,
+                "port": node.port,
+                "password": node.password,
+                "level": 0
+                // No `flow`: Xray answers any non-empty Trojan flow with a
+                // removed-feature error and refuses to start.
+            }]
+        }),
+        "shadowsocks" => json!({
+            "servers": [{
+                "address": node.server,
+                "port": node.port,
+                "method": node.method,
+                "password": node.password,
+                "level": 0
+            }]
+        }),
+        _ => json!({
             "vnext": [{
                 "address": node.server,
                 "port": node.port,
                 "users": [build_user(node)]
             }]
-        },
-        "streamSettings": stream
-    })
+        }),
+    }
 }
 
 fn build_user(node: &Node) -> Value {
@@ -1231,6 +1282,55 @@ mod tests {
             assert!(!keys.iter().any(|k| *k == absent), "{absent} does not belong here");
         }
         assert_eq!(r["mldsa65Verify"], "xyz");
+    }
+
+    /// VLESS and VMess address a server through `vnext` with a user account;
+    /// Trojan and Shadowsocks through `servers` with the password on the
+    /// server. Getting the shape wrong is a config Xray will not load.
+    #[test]
+    fn each_protocol_gets_the_settings_shape_xray_expects() {
+        let vmess = state_with(&format!(
+            "vmess://{}",
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                r#"{"add":"a.com","port":"443","id":"the-uuid","aid":"0","scy":"auto","net":"tcp"}"#
+            )
+        ));
+        let o = &build_config(&vmess).unwrap()["outbounds"][0];
+        assert_eq!(o["protocol"], "vmess");
+        assert_eq!(o["settings"]["vnext"][0]["users"][0]["id"], "the-uuid");
+        assert_eq!(o["settings"]["vnext"][0]["users"][0]["security"], "auto");
+
+        let trojan = state_with("trojan://the-password@a.com:443#t");
+        let o = &build_config(&trojan).unwrap()["outbounds"][0];
+        assert_eq!(o["protocol"], "trojan");
+        assert_eq!(o["settings"]["servers"][0]["password"], "the-password");
+        assert!(
+            o["settings"]["servers"][0].get("flow").is_none(),
+            "a Trojan flow is a removed-feature error in Xray"
+        );
+
+        let ss = state_with("ss://aes-256-gcm:the-key@a.com:8388#s");
+        let o = &build_config(&ss).unwrap()["outbounds"][0];
+        assert_eq!(o["protocol"], "shadowsocks");
+        assert_eq!(o["settings"]["servers"][0]["method"], "aes-256-gcm");
+        assert_eq!(o["settings"]["servers"][0]["password"], "the-key");
+    }
+
+    /// Level 0 is the only bucket this config defines. Any other value falls
+    /// back to Xray's default 300-second idle timeout, silently discarding the
+    /// conn_idle_secs setting -- which is what v2rayNG's level 8 does.
+    #[test]
+    fn every_protocol_stays_on_the_policy_level_we_define() {
+        for uri in [
+            "vless://u@a.com:443#v",
+            "trojan://pw@a.com:443#t",
+            "ss://aes-256-gcm:pw@a.com:8388#s",
+        ] {
+            let s = state_with(uri);
+            let text = build_config(&s).unwrap()["outbounds"][0]["settings"].to_string();
+            assert!(text.contains("\"level\":0"), "{uri}: {text}");
+        }
     }
 
     #[test]

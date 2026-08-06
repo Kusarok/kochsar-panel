@@ -29,6 +29,17 @@ pub struct Node {
     pub flow: String,
     #[serde(default = "d_none")]
     pub encryption: String,
+    /// Trojan password, or the Shadowsocks pre-shared key.
+    ///
+    /// Deliberately separate from `uuid` rather than overloading it: the two
+    /// are different secrets with different rules, and a single field read by
+    /// two protocols is the kind of thing that survives a refactor and then
+    /// sends a Trojan password where a UUID was expected.
+    #[serde(default)]
+    pub password: String,
+    /// Shadowsocks cipher, or the VMess `security` (its `scy` field).
+    #[serde(default)]
+    pub method: String,
 
     // --- stream settings ---
     /// `tcp` | `ws` | `grpc` | `xhttp` | `httpupgrade`
@@ -133,6 +144,8 @@ impl Default for Node {
             uuid: String::new(),
             flow: String::new(),
             encryption: d_none(),
+            password: String::new(),
+            method: String::new(),
             network: d_tcp(),
             security: d_none(),
             sni: String::new(),
@@ -171,14 +184,20 @@ impl Node {
     /// every refresh. Two entries that differ only by remark collapse into one,
     /// which is the desired behaviour.
     pub fn compute_id(&self) -> String {
+        // The credential belongs in here. Two Trojan servers on one host and
+        // port with different passwords are two accounts, and hashing only the
+        // uuid -- which Trojan does not have -- would collapse them into one.
         let ident = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}{}|{}|{}|{}|{}|{}|{}|{}",
             self.protocol,
             self.server,
             self.port,
             self.uuid,
+            self.password,
+            self.method,
             self.network,
             self.security,
+            self.header_type,
             self.path,
             self.service_name,
             self.short_id,
