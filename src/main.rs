@@ -130,12 +130,8 @@ fn main() -> ExitCode {
             .map(|h| probe::resolve_all(&h))
             .unwrap_or_default();
         let plan = app.tproxy_plan(ips);
-        // The drop-in lives on tmpfs, so a reboot removed it; put it back
-        // before the rules start redirecting queries at it.
-        match dnsmasq::install(app.state.settings.dns_port) {
-            Ok(()) => app.dns_via_tunnel = true,
-            Err(e) => eprintln!("xrayopd: could not restore tunnelled DNS: {e}"),
-        }
+        // Ruleset first: the dnsmasq drop-in names our nftables set, so the
+        // table has to exist before dnsmasq is asked to file addresses into it.
         match tproxy::apply(&plan) {
             Ok(()) => app.tproxy_applied = true,
             Err(e) => {
@@ -143,6 +139,13 @@ fn main() -> ExitCode {
                 // rather than silently pretending the tunnel is intercepting.
                 eprintln!("xrayopd: could not restore transparent proxy: {e}");
             }
+        }
+        // The drop-in lives on tmpfs, so a reboot removed it; put it back.
+        let bypass = app.server_hostnames();
+        let resolver = app.state.settings.dns_bypass_resolver.clone();
+        match dnsmasq::install(app.state.settings.dns_port, &bypass, &resolver) {
+            Ok(()) => app.dns_via_tunnel = true,
+            Err(e) => eprintln!("xrayopd: could not restore tunnelled DNS: {e}"),
         }
     } else if tproxy::is_applied() {
         // Rules exist that we did not sanction. This is what a crash during the

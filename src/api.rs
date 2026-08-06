@@ -562,6 +562,16 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
             next.test_url_custom = u.to_string();
         }
     }
+    if let Some(raw) = body.get("dns_bypass_resolver") {
+        let v = raw.as_str().unwrap_or_default().trim();
+        // Must be a plain address: this one is queried directly, outside the
+        // tunnel, so a DoH URL here would need its own name resolved first and
+        // reintroduce the deadlock it exists to prevent.
+        if v.parse::<std::net::IpAddr>().is_err() {
+            return Err("the bypass resolver must be a plain IP address".into());
+        }
+        next.dns_bypass_resolver = v.to_string();
+    }
     if let Some(raw) = body.get("probe_base_port") {
         next.probe_base_port = port_of(raw).ok_or("probe_base_port must be between 1 and 65535")?;
     }
@@ -655,16 +665,14 @@ fn handle_tproxy_enable(app: &Arc<Mutex<App>>) -> Body {
         }
     }
 
-    // 2. Point the LAN's resolver at Xray before any rule redirects a query
-    //    to it, so no client ever meets a dead resolver.
-    let dns_port = lock(app).state.settings.dns_port;
-    if let Err(e) = dnsmasq::install(dns_port) {
-        rollback_tproxy(app);
-        return error(500, &format!("could not route DNS through the tunnel: {e}"));
-    }
-    lock(app).dns_via_tunnel = true;
-
-    // 3. Then the ruleset.
+    // 2. The ruleset. This has to precede the dnsmasq change, because the
+    //    drop-in carries an `nftset` directive naming our table -- dnsmasq
+    //    would be pointed at a set that does not exist yet.
+    //
+    //    Safe to do first: the DNS redirect it installs sends queries to the
+    //    router's own resolver, which at this moment is still answering the way
+    //    it always did. Traffic is tunnelled, DNS is not, and nothing is
+    //    broken in between.
     {
         let plan = lock(app).tproxy_plan(server_ips.clone());
         if let Err(e) = tproxy::apply(&plan) {
@@ -672,6 +680,21 @@ fn handle_tproxy_enable(app: &Arc<Mutex<App>>) -> Body {
             return error(500, &e);
         }
     }
+
+    // 3. Now point the resolver at Xray.
+    let (dns_port, bypass, resolver) = {
+        let a = lock(app);
+        (
+            a.state.settings.dns_port,
+            a.server_hostnames(),
+            a.state.settings.dns_bypass_resolver.clone(),
+        )
+    };
+    if let Err(e) = dnsmasq::install(dns_port, &bypass, &resolver) {
+        rollback_tproxy(app);
+        return error(500, &format!("could not route DNS through the tunnel: {e}"));
+    }
+    lock(app).dns_via_tunnel = true;
 
     // 4. Arm the rollback. Deliberately *not* saved yet: if the router drops
     //    off the network now, a reboot must come back without any of this.

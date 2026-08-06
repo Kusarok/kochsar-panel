@@ -96,6 +96,23 @@ impl App {
         self.state.find(&self.state.active).map(|n| n.server.clone())
     }
 
+    /// Hostnames of every configured server, for the DNS bypass rules.
+    ///
+    /// All of them, not just the active one: switching servers must not require
+    /// a DNS round trip that cannot complete.
+    pub fn server_hostnames(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .state
+            .nodes
+            .iter()
+            .map(|n| n.server.clone())
+            .filter(|h| is_resolvable_hostname(h))
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+
     /// Builds the ruleset plan. `server_ips` comes from
     /// [`App::active_server_ips`], resolved outside the lock.
     pub fn tproxy_plan(&self, server_ips: Vec<std::net::IpAddr>) -> crate::tproxy::Plan {
@@ -335,6 +352,38 @@ impl App {
     }
 }
 
+/// Whether `host` is something worth writing a dnsmasq rule for.
+///
+/// Subscriptions carry entries that are not servers at all -- providers put
+/// notices in the node list, and one on this router parses to a server field of
+/// `1405-06-12`. A rule for a name that cannot exist is harmless but it is
+/// noise in a generated config, and noise is where real problems hide.
+///
+/// A literal address is excluded for the opposite reason: it needs no
+/// resolution, so a rule for it would be meaningless.
+fn is_resolvable_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.contains('.')
+        && host.parse::<std::net::IpAddr>().is_err()
+        && host.len() <= 253
+        && host
+            .split('.')
+            .all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+        // A trailing all-numeric label means it is an address-like string, not
+        // a hostname.
+        && !host
+            .rsplit('.')
+            .next()
+            .map(|tld| tld.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(true)
+}
+
 /// A readable label for a subscription URL: host plus the last path segment.
 fn short_label(url: &str) -> String {
     let rest = url
@@ -556,6 +605,38 @@ mod tests {
         let (app, warning) = App::load(path, &dir);
         assert!(warning.is_some(), "should report the problem");
         assert!(app.state.nodes.is_empty(), "and start clean");
+    }
+
+    /// Subscriptions carry entries that are not servers. One on the target
+    /// router parses to a server field of `1405-06-12`, which produced a
+    /// nonsense dnsmasq rule.
+    #[test]
+    fn only_real_hostnames_get_dns_rules() {
+        for good in ["a.example.com", "node.example.net", "x.co"] {
+            assert!(is_resolvable_hostname(good), "{good} should be kept");
+        }
+        for bad in [
+            "1405-06-12",   // a date from a provider notice
+            "",
+            "localhost",    // no dot
+            "1.2.3.4",      // literal, needs no resolution
+            "2001:db8::1",
+            "a..b",
+            "a.b.123",      // numeric TLD
+        ] {
+            assert!(!is_resolvable_hostname(bad), "{bad:?} should be dropped");
+        }
+    }
+
+    #[test]
+    fn hostname_list_is_sorted_and_deduped() {
+        let mut app = app();
+        app.add_nodes_from_text(
+            "vless://u@b.example.com:443#B
+vless://u@a.example.com:443#A
+vless://u@a.example.com:444#A2",
+        );
+        assert_eq!(app.server_hostnames(), ["a.example.com", "b.example.com"]);
     }
 
     #[test]

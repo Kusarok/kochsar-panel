@@ -274,6 +274,14 @@ pub struct Settings {
     /// First port of the range the latency probe binds, one per node.
     #[serde(default = "d_probe_base_port")]
     pub probe_base_port: u16,
+    /// Resolver used for the proxy servers' own hostnames, queried directly
+    /// rather than through the tunnel.
+    ///
+    /// Required to break the resolution deadlock: with `no-resolv`, dnsmasq's
+    /// only upstream is Xray, and Xray cannot answer until it has connected to
+    /// a server whose address it cannot resolve. See [`crate::dnsmasq::install`].
+    #[serde(default = "d_bypass_resolver")]
+    pub dns_bypass_resolver: String,
     /// Redirect every LAN query to the router's resolver.
     ///
     /// On by default: a device with a hardcoded public resolver would otherwise
@@ -311,6 +319,9 @@ fn d_dns_port() -> u16 {
 }
 fn d_test_target() -> String {
     "google".into()
+}
+fn d_bypass_resolver() -> String {
+    "1.1.1.1".into()
 }
 /// High and unremarkable; only ever bound on loopback and only during a sweep.
 fn d_probe_base_port() -> u16 {
@@ -355,6 +366,7 @@ impl Default for Settings {
             tunnel_ipv6: false,
             dns_port: d_dns_port(),
             dns_redirect: true,
+            dns_bypass_resolver: d_bypass_resolver(),
             test_target: d_test_target(),
             test_url_custom: String::new(),
             probe_base_port: d_probe_base_port(),

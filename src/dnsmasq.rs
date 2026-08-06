@@ -98,15 +98,23 @@ fn running_config_path() -> Option<PathBuf> {
 /// `no-resolv` is what makes this airtight: without it dnsmasq keeps the ISP
 /// resolvers from `resolv.conf.auto` as additional upstreams and will happily
 /// race them against ours, which is a DNS leak that looks like it works.
-pub fn install(port: u16) -> Result<(), String> {
+///
+/// `bypass_domains` are the proxy servers' own hostnames, sent straight to
+/// `direct_resolver` instead. Without them the whole arrangement deadlocks:
+/// dnsmasq's only upstream is Xray, Xray needs the tunnel to answer a query,
+/// the tunnel needs the server's address, and resolving *that* comes back to
+/// dnsmasq. Xray reports it as `dial tcp: lookup <server>: i/o timeout` and the
+/// LAN loses DNS completely. Passwall2 breaks the same cycle the same way, with
+/// per-domain `server=/.../` rules.
+pub fn install(
+    port: u16,
+    bypass_domains: &[String],
+    direct_resolver: &str,
+) -> Result<(), String> {
     let dir = conf_dir()?;
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
-    let body = format!(
-        "# Written by xrayop. Removed when the transparent proxy is disabled.\n\
-         no-resolv\n\
-         server=127.0.0.1#{port}\n"
-    );
+    let body = render(port, bypass_domains, direct_resolver);
     let path = dir.join(DROPIN);
     fs::write(&path, body).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
 
@@ -116,6 +124,39 @@ pub fn install(port: u16) -> Result<(), String> {
         let _ = fs::remove_file(&path);
         e
     })
+}
+
+/// Renders the drop-in. Split out so the deadlock guard can be tested.
+///
+/// Mirrors what Passwall2's `helper_dnsmasq.lua` generates, under the comment
+/// "Always use domestic DNS to resolve node domain names": a per-domain rule
+/// sending each proxy server's hostname to a directly-reachable resolver, and
+/// an `nftset` directive that files the answer into the bypass set.
+fn render(port: u16, bypass_domains: &[String], direct_resolver: &str) -> String {
+    let mut body = String::from(
+        "# Written by xrayop. Removed when the transparent proxy is disabled.\n\
+         no-resolv\n\
+         no-poll\n",
+    );
+
+    // Per-domain rules first. dnsmasq picks the longest match regardless of
+    // order, but the file should read the way it is reasoned about: these are
+    // the exceptions, the catch-all below is the rule.
+    for domain in bypass_domains {
+        body.push_str(&format!("server=/{domain}/{direct_resolver}\n"));
+        // Whatever address the server resolves to goes straight into the
+        // nftables bypass set. Resolving once when the tunnel is enabled would
+        // go stale the moment the provider rotates an address -- and a stale
+        // bypass entry means Xray's own connection starts getting intercepted.
+        // Keeping it live is Passwall2's `set_domain_ipset(address, psw2_vps)`.
+        body.push_str(&format!(
+            "nftset=/{domain}/4#inet#{table}#bypass4,6#inet#{table}#bypass6\n",
+            table = crate::tproxy::TABLE
+        ));
+    }
+
+    body.push_str(&format!("server=127.0.0.1#{port}\n"));
+    body
 }
 
 /// Removes the drop-in and restarts dnsmasq. Safe when nothing is installed.

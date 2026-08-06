@@ -300,24 +300,59 @@ fn route_args(plan: &Plan) -> Vec<Vec<String>> {
     cmds
 }
 
-/// Whether Passwall2's nftables table is currently loaded.
+/// Whether Passwall2 is actually intercepting traffic.
 ///
 /// Both projects register a base chain at `prerouting mangle - 1` and both
 /// install a `local default dev lo` route. Which tproxy fires first then
 /// depends on kernel registration order, and each one's divert chain re-marks
 /// the other's flows. That is not a supportable state, so we refuse to apply
 /// rather than produce an outage nobody can diagnose.
+///
+/// Counting *rules* rather than testing for the table is the whole point:
+/// `/etc/init.d/passwall2 stop` flushes its chains but leaves the table shell
+/// behind, with four empty base chains that match nothing. Treating that as
+/// "active" would mean a correctly stopped Passwall2 blocks us forever, with an
+/// error message telling the user to stop something they already stopped.
 pub fn passwall2_active() -> bool {
-    run(
+    table_rule_count("inet", "passwall2") > 0
+}
+
+/// Number of actual rules in a table, ignoring declarations.
+fn table_rule_count(family: &str, table: &str) -> usize {
+    let Ok(out) = capture(
         "nft",
         &[
             "list".into(),
             "table".into(),
-            "inet".into(),
-            "passwall2".into(),
+            family.into(),
+            table.into(),
         ],
-    )
-    .is_ok()
+    ) else {
+        return 0; // no such table
+    };
+
+    count_rule_lines(&out)
+}
+
+/// The pure part of [`table_rule_count`], split out so it can be tested
+/// against real `nft list` output without a kernel.
+fn count_rule_lines(listing: &str) -> usize {
+    /// Line prefixes that describe structure rather than express a rule.
+    const DECLARATIONS: &[&str] = &[
+        "table ", "chain ", "set ", "map ", "type ", "elements", "flags ", "auto-merge", "size ",
+        "timeout ", "policy ", "comment ",
+    ];
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            !l.is_empty()
+                && *l != "}"
+                && *l != "{"
+                && !l.starts_with('#')
+                && !DECLARATIONS.iter().any(|d| l.starts_with(d))
+        })
+        .count()
 }
 
 /// Validates the ruleset against the running kernel without applying it.
@@ -445,6 +480,20 @@ fn nft(args: &[&str], stdin: &str) -> Result<String, String> {
     let out = child
         .wait_with_output()
         .map_err(|e| format!("nft did not finish: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+/// Like [`run`], but returns stdout.
+fn capture(program: &str, args: &[String]) -> Result<String, String> {
+    let out = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run {program}: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -670,6 +719,31 @@ mod tests {
 
     /// Sharing a routing table with Passwall2 and then flushing it is how an
     /// earlier version of this file would have taken down a working tunnel.
+    /// `/etc/init.d/passwall2 stop` leaves an empty table behind. Treating
+    /// that as "still running" would block us permanently after a correct stop.
+    #[test]
+    fn an_emptied_table_does_not_count_as_active() {
+        let emptied = "table inet passwall2 {
+             	chain dstnat {
+             		type nat hook prerouting priority dstnat - 1; policy accept;
+             	}
+             	chain mangle_prerouting {
+             		type filter hook prerouting priority mangle - 1; policy accept;
+             	}
+             }
+";
+        assert_eq!(count_rule_lines(emptied), 0);
+
+        let live = "table inet passwall2 {
+             	chain PSW2_MANGLE {
+             		ip daddr @psw2_direct counter packets 26400 bytes 3078761 return
+             		ct direction reply counter return
+             	}
+             }
+";
+        assert_eq!(count_rule_lines(live), 2);
+    }
+
     #[test]
     fn routing_does_not_collide_with_passwall2() {
         assert_ne!(ROUTE_TABLE, 999, "999 is Passwall2's table");
