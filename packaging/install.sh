@@ -184,7 +184,10 @@ if pgrep -f 'bin/xrayopd' >/dev/null; then
     echo
     # A reinstall keeps whatever mode was already set, so only describe the
     # starting point when this really is one.
-    MODE="$(sed -n 's/.*"mode": "\([a-z]*\)".*//p' "$STATE_DIR/state.json" 2>/dev/null)"
+    # Each node carries its own "mode" (the transport: gun, multi, auto), and
+    # those are usually empty. Requiring a non-empty value and taking the last
+    # match picks the settings one, which is written after the node list.
+    MODE="$(sed -n 's/.*"mode": "\([a-z][a-z]*\)".*/\1/p' "$STATE_DIR/state.json" 2>/dev/null | tail -1)"
     case "${MODE:-proxy}" in
         global)
             echo "Restored in global mode: the whole LAN goes through the tunnel."
