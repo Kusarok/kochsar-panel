@@ -66,6 +66,15 @@ pub struct Node {
     /// gRPC (`gun`/`multi`) or xhttp (`auto`/`packet-up`/`stream-up`) mode.
     #[serde(default)]
     pub mode: String,
+    /// `headerType` from the URI: `http` disguises a raw TCP stream as an HTTP
+    /// request, `none` (or absent) leaves it bare.
+    ///
+    /// Only meaningful for `network = tcp`. Dropping it was a real outage: the
+    /// server waits for a request line that never arrives and closes the
+    /// connection, so every such node reported as unreachable while working
+    /// perfectly in other clients.
+    #[serde(default)]
+    pub header_type: String,
     #[serde(default)]
     pub allow_insecure: bool,
 
@@ -116,6 +125,7 @@ impl Default for Node {
             host: String::new(),
             service_name: String::new(),
             mode: String::new(),
+            header_type: String::new(),
             allow_insecure: false,
             sub_id: String::new(),
             latency: Node::LATENCY_UNTESTED,

@@ -104,6 +104,7 @@ pub fn parse_uri(uri: &str) -> Result<Node, String> {
         }
     };
     node.mode = q.get("mode");
+    node.header_type = q.get("headerType");
     node.allow_insecure = {
         let a = q.get("allowInsecure");
         let a = if a.is_empty() { q.get("insecure") } else { a };

@@ -365,11 +365,75 @@ fn build_stream(node: &Node) -> Value {
             }
             stream.insert("httpupgradeSettings".into(), Value::Object(h));
         }
-        // Plain TCP needs no extra block.
+        "tcp" | "raw" => {
+            // Only when the link asks for the HTTP disguise. Bare TCP needs no
+            // block at all, and Xray treats a missing one as `header.type=none`.
+            if node.header_type.eq_ignore_ascii_case("http") {
+                stream.insert(
+                    "tcpSettings".into(),
+                    json!({ "header": http_header(node) }),
+                );
+            }
+        }
         _ => {}
     }
 
     Value::Object(stream)
+}
+
+/// The `tcpSettings.header` block for `headerType=http`.
+///
+/// Xray wraps the connection in an authenticator that writes this as a real
+/// HTTP request, and the server matches on it. Get it wrong and the connection
+/// is accepted at TCP level and then dropped, which reads as "server is down".
+///
+/// Every header is written explicitly, and that is the whole point: Xray fills
+/// in defaults of its own when `request.headers` is absent -- `Host` becomes
+/// `www.baidu.com, www.bing.com` (`infra/conf/transport_authenticators.go`).
+/// A config emitting only `{"type":"http"}` is therefore valid, starts
+/// cleanly, and still fails, with the node's real host nowhere in the request.
+///
+/// `host` and `path` may carry comma-separated lists; both are passed through
+/// as arrays, which is what Xray's `StringList` expects.
+fn http_header(node: &Node) -> Value {
+    let split = |s: &str, fallback: &str| -> Vec<String> {
+        let out: Vec<String> = s
+            .split(',')
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        if out.is_empty() {
+            vec![fallback.to_string()]
+        } else {
+            out
+        }
+    };
+    // Falling back to the server address mirrors what other clients do when a
+    // link sets `headerType=http` but leaves `host` out.
+    let hosts = split(
+        if node.host.is_empty() { &node.server } else { &node.host },
+        &node.server,
+    );
+
+    json!({
+        "type": "http",
+        "request": {
+            "version": "1.1",
+            "method": "GET",
+            "path": split(&node.path, "/"),
+            "headers": {
+                "Host": hosts,
+                "User-Agent": [
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1"
+                ],
+                "Accept-Encoding": ["gzip, deflate"],
+                "Connection": ["keep-alive"],
+                "Pragma": "no-cache"
+            }
+        }
+    })
 }
 
 fn non_empty<'a>(v: &'a str, default: &'a str) -> &'a str {
@@ -1004,6 +1068,85 @@ mod tests {
         assert_eq!(st["wsSettings"]["path"], "/x");
         assert_eq!(st["tlsSettings"]["serverName"], "cdn.example.com");
         assert_eq!(st["sockopt"]["mark"], crate::tproxy::XRAY_MARK);
+    }
+
+    /// Eight of the user's servers reported unreachable while working in
+    /// v2rayNG on the same network. They all carried `headerType=http`, which
+    /// was parsed away, so Xray sent raw VLESS bytes to a server waiting for a
+    /// request line.
+    #[test]
+    fn tcp_with_an_http_header_gets_one() {
+        let s = state_with(
+            "vless://uu@ex.com:443?type=tcp&headerType=http&host=play.google.com&path=%2F#n",
+        );
+        let h = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["tcpSettings"]["header"];
+        assert_eq!(h["type"], "http");
+        assert_eq!(h["request"]["method"], "GET");
+        assert_eq!(h["request"]["path"][0], "/");
+        assert_eq!(h["request"]["headers"]["Host"][0], "play.google.com");
+    }
+
+    /// The trap: Xray fills in `Host: www.baidu.com, www.bing.com` when
+    /// `request.headers` is missing. A config emitting only `{"type":"http"}`
+    /// is valid, starts cleanly, and still cannot connect.
+    #[test]
+    fn the_host_header_is_never_left_to_xrays_default() {
+        let s = state_with("vless://uu@ex.com:443?type=tcp&headerType=http&host=cdn.test#n");
+        let h = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["tcpSettings"]["header"];
+        let headers = &h["request"]["headers"];
+        assert!(headers.is_object(), "headers must be written, not defaulted");
+        assert_eq!(headers["Host"][0], "cdn.test");
+        let text = h.to_string();
+        assert!(!text.contains("baidu") && !text.contains("bing"));
+    }
+
+    /// A link that sets the disguise but omits `host` still has to send a
+    /// plausible one, so fall back to the address rather than to Xray's.
+    #[test]
+    fn a_missing_host_falls_back_to_the_server_address() {
+        let s = state_with("vless://uu@ex.com:443?type=tcp&headerType=http#n");
+        let h = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["tcpSettings"]["header"];
+        assert_eq!(h["request"]["headers"]["Host"][0], "ex.com");
+    }
+
+    /// Both fields may carry lists; Xray's StringList takes arrays.
+    #[test]
+    fn comma_separated_hosts_and_paths_become_arrays() {
+        let s = state_with(
+            "vless://uu@ex.com:443?type=tcp&headerType=http&host=a.com,b.com&path=/x,/y#n",
+        );
+        let r = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["tcpSettings"]["header"]
+            ["request"];
+        assert_eq!(r["headers"]["Host"].as_array().unwrap().len(), 2);
+        assert_eq!(r["headers"]["Host"][1], "b.com");
+        assert_eq!(r["path"].as_array().unwrap().len(), 2);
+        assert_eq!(r["path"][1], "/y");
+    }
+
+    /// Bare TCP must stay bare. Emitting a header block where the link asked
+    /// for none would break the 22 nodes that currently work.
+    #[test]
+    fn tcp_without_the_disguise_gets_no_settings_block() {
+        for uri in [
+            "vless://uu@ex.com:443?type=tcp#n",
+            "vless://uu@ex.com:443?type=tcp&headerType=none#n",
+        ] {
+            let cfg = build_config(&state_with(uri)).unwrap();
+            assert!(
+                cfg["outbounds"][0]["streamSettings"].get("tcpSettings").is_none(),
+                "{uri} should produce no tcpSettings"
+            );
+        }
+    }
+
+    /// The disguise belongs to raw TCP only; a ws node carries its host in
+    /// wsSettings and must not grow a second copy here.
+    #[test]
+    fn the_http_disguise_is_not_applied_to_other_transports() {
+        let s = state_with("vless://uu@ex.com:443?type=ws&headerType=http&host=a.com#n");
+        let st = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"];
+        assert!(st.get("tcpSettings").is_none());
+        assert_eq!(st["wsSettings"]["host"], "a.com");
     }
 
     #[test]

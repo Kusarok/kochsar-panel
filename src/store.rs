@@ -63,6 +63,45 @@ impl App {
     /// A corrupt state file is reported but not fatal: the daemon comes up
     /// empty rather than refusing to start, which on a router is the difference
     /// between a fixable panel and an unreachable one.
+    /// Re-derives every node from the URI it was imported from.
+    ///
+    /// The stored fields are a cache of what the parser made of `raw`, and the
+    /// parser gains capabilities over time. `headerType` is the case that
+    /// forced this: it was added after these nodes were written, so eight of
+    /// them had been emitted without their HTTP disguise and reported as
+    /// unreachable while working fine in other clients. Migrating field by
+    /// field on every such fix does not scale -- the URI is the source of
+    /// truth, so re-read it.
+    ///
+    /// The name, the last measurement and the owning subscription are kept:
+    /// providers rename servers, and a latency table that emptied itself on
+    /// every upgrade would be worse than the bug. If a fix changes a field that
+    /// feeds the identity, the selection is carried across to the new id rather
+    /// than silently pointing at nothing.
+    fn reparse_nodes(state: &mut State) {
+        let mut moved: Vec<(String, String)> = Vec::new();
+        for node in &mut state.nodes {
+            if node.raw.is_empty() {
+                continue;
+            }
+            let Ok(mut fresh) = crate::parse::parse_uri(&node.raw) else {
+                continue; // keep what we have; a link we can no longer read is not an improvement
+            };
+            fresh.name = node.name.clone();
+            fresh.latency = node.latency;
+            fresh.sub_id = node.sub_id.clone();
+            if fresh.id != node.id {
+                moved.push((node.id.clone(), fresh.id.clone()));
+            }
+            *node = fresh;
+        }
+        for (old, new) in moved {
+            if state.active == old {
+                state.active = new;
+            }
+        }
+    }
+
     pub fn load(state_path: PathBuf, runtime_dir: &Path) -> (Self, Option<String>) {
         let mut warning = None;
         let state = match fs::read_to_string(&state_path) {
@@ -91,6 +130,8 @@ impl App {
         // `mode` is what the user sets; `transparent` is what the rules read.
         // Deriving one from the other here means there is only ever one answer.
         state.settings.transparent = state.settings.mode == "global";
+
+        Self::reparse_nodes(&mut state);
 
         let app = App {
             state,
@@ -618,6 +659,55 @@ mod tests {
         app.add_nodes_from_text(A);
         assert!(app.restore_backup().is_err());
         assert_eq!(app.state.nodes.len(), 1, "live state must be untouched");
+    }
+
+    /// State written before `headerType` was understood still holds the URI
+    /// that carries it, so an upgrade fixes those nodes without the user
+    /// touching anything.
+    #[test]
+    fn nodes_are_re_derived_from_their_uri_on_load() {
+        let mut state = State::default();
+        let mut stale = crate::parse::parse_uri(
+            "vless://uu@ex.com:443?type=tcp&headerType=http&host=a.com#Server",
+        )
+        .unwrap();
+        // What an older build would have persisted: the field did not exist.
+        stale.header_type = String::new();
+        stale.latency = 123;
+        stale.name = "Renamed by the provider".into();
+        state.active = stale.id.clone();
+        state.nodes.push(stale);
+
+        App::reparse_nodes(&mut state);
+
+        let n = &state.nodes[0];
+        assert_eq!(n.header_type, "http", "the fix must reach existing nodes");
+        assert_eq!(n.latency, 123, "measurements are not thrown away");
+        assert_eq!(n.name, "Renamed by the provider", "nor is the display name");
+        assert_eq!(state.active, n.id, "and the selection still points at it");
+    }
+
+    /// A hand-added node with no URI, or one whose link no longer parses, must
+    /// survive rather than be silently emptied.
+    #[test]
+    fn nodes_without_a_usable_uri_are_left_alone() {
+        let mut state = State::default();
+        let mut manual = Node {
+            name: "no raw".into(),
+            server: "keep.me".into(),
+            ..Default::default()
+        };
+        manual.id = manual.compute_id();
+        let mut broken = manual.clone();
+        broken.raw = "not-a-link".into();
+        broken.server = "also.keep".into();
+        state.nodes.push(manual);
+        state.nodes.push(broken);
+
+        App::reparse_nodes(&mut state);
+
+        assert_eq!(state.nodes[0].server, "keep.me");
+        assert_eq!(state.nodes[1].server, "also.keep");
     }
 
     #[test]
