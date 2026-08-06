@@ -224,10 +224,20 @@ fn sockopt_mark(transparent: bool) -> Value {
     }
 }
 
-/// An outbound for the latency probe: the same server, a different tag, and
-/// none of the transparent-mode socket marking (the probe never touches the
-/// firewall, so a mark would only confuse things).
-pub fn probe_outbound(node: &Node, tag: &str) -> Value {
+/// An outbound for the latency probe: the same server, a different tag.
+///
+/// It carries the same socket mark as the live outbound when the router's own
+/// traffic is being tunnelled. Without it the probe's own connections would be
+/// intercepted by our output chain and measured *through the active tunnel* --
+/// so every server would report the latency of the one already in use, which is
+/// exactly the comparison the sweep exists to avoid.
+pub fn probe_outbound(node: &Node, tag: &str, marked: bool) -> Value {
+    let mut stream = build_stream(node);
+    if marked {
+        if let Some(obj) = stream.as_object_mut() {
+            obj.insert("sockopt".into(), sockopt_mark(true));
+        }
+    }
     json!({
         "tag": tag,
         "protocol": "vless",
@@ -238,7 +248,7 @@ pub fn probe_outbound(node: &Node, tag: &str) -> Value {
                 "users": [build_user(node)]
             }]
         },
-        "streamSettings": build_stream(node)
+        "streamSettings": stream
     })
 }
 

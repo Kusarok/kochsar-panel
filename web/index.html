@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
-<title>xrayop</title>
+<title>kochsar</title>
 <style>
 /* Soft-UI (neumorphic) dark theme. The trick is that raised surfaces are the
    SAME colour as the background -- depth comes only from paired shadows, one
@@ -249,7 +249,7 @@ pre.log{
      it carries no data -- so this is the only gate the user ever sees. -->
 <div id="login" hidden style="flex:1;display:flex;align-items:center;justify-content:center;padding:24px">
   <div class="card" style="max-width:420px;width:100%">
-    <div class="brand" style="margin-bottom:6px">xray<span>op</span></div>
+    <div class="brand" style="margin-bottom:6px">koch<span>sar</span></div>
     <p class="note" data-t="tokenHelp"></p>
     <pre class="log" style="max-height:none;margin:0 0 14px" data-t="tokenCmd"></pre>
     <div class="field">
@@ -263,7 +263,7 @@ pre.log{
 
 <div id="app" hidden style="display:contents">
 <header>
-  <div class="brand">xray<span>op</span></div>
+  <div class="brand">koch<span>sar</span></div>
   <div class="grow"></div>
   <button class="btn sm" id="langBtn">EN</button>
 </header>
@@ -452,6 +452,27 @@ pre.log{
     </details>
 
     <details class="sec">
+      <summary data-t="autoSwitch">Automatic failover</summary>
+      <div class="sec-body">
+        <p class="note" data-t="autoNote"></p>
+        <div class="tog">
+          <div class="t"><span data-t="autoEnable">Switch to the best server automatically</span>
+            <small data-t="autoEnableHint"></small></div>
+          <button class="sw" id="swAuto" role="switch"></button>
+        </div>
+        <div id="autoOpts" hidden>
+          <div class="field" style="margin-top:12px">
+            <label data-t="autoMinutes">Check every (minutes)</label>
+            <input id="autoMinutes" type="number" min="5" max="10080" dir="ltr">
+          </div>
+          <p class="note" data-t="autoTargetNote"></p>
+          <button class="btn pri" id="btnSaveAuto" data-t="save">Save</button>
+          <div id="autoStatus" style="margin-top:14px"></div>
+        </div>
+      </div>
+    </details>
+
+    <details class="sec">
       <summary data-t="testing">Connection test</summary>
       <div class="sec-body">
         <p class="note" data-t="testNote"></p>
@@ -577,6 +598,14 @@ const I18N = {
     routeOnlyHint:"Keeps the original destination. Turning this off breaks Tor, Apple push and some IoT devices.",
     restore:"Restore server list", forget:"Forget token",
     restored:"{0} servers restored",
+    autoSwitch:"Automatic failover", autoEnable:"Switch to the best server automatically",
+    autoEnableHint:"Tests every server and moves if one is clearly better.",
+    autoNote:"Every server is measured through its own connection, not through the one in use, so a failing server cannot make the others look bad. A dead server is replaced within a few minutes; a working one is only replaced when the alternative is clearly better, because every switch drops live connections.",
+    autoMinutes:"Check every (minutes)",
+    autoTargetNote:"The destination is the one set under Connection test.",
+    autoSwitches:"{0} automatic switches", autoLastSwitch:"last: {0} ({1})",
+    autoLastSweep:"last check {0}", autoNever:"no checks yet",
+    reasonScheduled:"scheduled", reasonFailover:"failover",
     testing:"Connection test", customUrl:"Custom URL",
     testNote:"Servers are tested by making a real request through each one. Pick the destination you actually care about — a server can reach Google and still fail on Instagram.",
     testingNow:"Testing through {0}…",
@@ -639,6 +668,14 @@ const I18N = {
     routeOnlyHint:"مقصد اصلی را دست‌نخورده نگه می‌دارد. خاموش‌کردنش Tor، اعلان‌های اپل و بعضی دستگاه‌های IoT را می‌شکند.",
     restore:"بازگرداندن لیست سرورها", forget:"فراموش‌کردن توکن",
     restored:"{0} سرور بازگردانده شد",
+    autoSwitch:"جایگزینی خودکار", autoEnable:"خودکار به بهترین سرور سوییچ کن",
+    autoEnableHint:"همهٔ سرورها را تست می‌کند و اگر یکی آشکارا بهتر بود جابه‌جا می‌شود.",
+    autoNote:"هر سرور از اتصال خودش سنجیده می‌شود، نه از سروری که در حال استفاده است — پس یک سرور خراب نمی‌تواند بقیه را بد نشان دهد. سرور قطع‌شده ظرف چند دقیقه جایگزین می‌شود؛ سرور سالم فقط وقتی عوض می‌شود که گزینهٔ دیگر آشکارا بهتر باشد، چون هر سوییچ اتصال‌های باز را قطع می‌کند.",
+    autoMinutes:"هر چند دقیقه بررسی شود",
+    autoTargetNote:"مقصد همان است که در بخش «تست اتصال» انتخاب کرده‌اید.",
+    autoSwitches:"{0} جابه‌جایی خودکار", autoLastSwitch:"آخرین: {0} ({1})",
+    autoLastSweep:"آخرین بررسی {0}", autoNever:"هنوز بررسی نشده",
+    reasonScheduled:"زمان‌بندی", reasonFailover:"قطعی سرور",
     testing:"تست اتصال", customUrl:"نشانی دلخواه",
     testNote:"هر سرور با یک درخواست واقعی از داخل خودش تست می‌شود. مقصدی را انتخاب کنید که واقعاً برایتان مهم است — یک سرور می‌تواند به گوگل برسد ولی روی اینستاگرام کار نکند.",
     testingNow:"در حال تست از طریق {0}…",
@@ -777,7 +814,7 @@ function render() {
   if (st.last_error) banner.appendChild(el("div", "err", st.last_error));
 
   startUptime(on ? st.started_at : 0);
-  renderMode(); renderNodes(); renderSubs(); renderDns(); renderTargets(); renderTproxy(); renderSettings();
+  renderMode(); renderNodes(); renderSubs(); renderDns(); renderTargets(); renderAuto(); renderTproxy(); renderSettings();
 }
 
 let uptimeTimer = null;
@@ -883,6 +920,27 @@ function renderMode() {
   $("#swRouterTraffic").className = "sw" + (state.settings.route_router_traffic ? " on" : "");
 }
 
+function renderAuto() {
+  const sw = state.switcher || {};
+  const on = !!sw.enabled;
+  $("#swAuto").className = "sw" + (on ? " on" : "");
+  $("#autoOpts").hidden = !on;
+  if (document.activeElement !== $("#autoMinutes")) $("#autoMinutes").value = sw.minutes || 240;
+
+  const box = $("#autoStatus");
+  box.replaceChildren();
+  if (!on) return;
+  const line = (txt) => box.appendChild(text(el("div", "muted"), txt));
+  line(sw.last_sweep ? t("autoLastSweep", ago(sw.last_sweep)) : t("autoNever"));
+  if (sw.switches > 0) {
+    line(t("autoSwitches", sw.switches));
+    if (sw.last_switch_to) {
+      const why = sw.last_switch_reason === "failover" ? t("reasonFailover") : t("reasonScheduled");
+      line(t("autoLastSwitch", sw.last_switch_to, why));
+    }
+  }
+}
+
 function renderTargets() {
   const grid = $("#targetGrid");
   grid.replaceChildren();
@@ -963,7 +1021,7 @@ function renderSettings() {
   kv(t("socksAt"), host + ":" + s.socks_port);
   kv(t("httpAt"), host + ":" + s.http_port);
   kv(t("state"), st_path());
-  kv(t("version"), "xrayop 0.1.0");
+  kv(t("version"), "kochsar 0.1.0");
 }
 function st_path() { return state.status.config_path.replace(/\/config\.json$/, ""); }
 
@@ -1079,6 +1137,12 @@ $("#btnLog").onclick = async () => {
 
 $("#btnTestUrl").onclick = () => run(() => api("/api/settings", {
   test_target: "custom", test_url_custom: $("#testUrl").value,
+}));
+
+$("#swAuto").onclick = () =>
+  run(() => api("/api/settings", { auto_switch: !state.settings.auto_switch }));
+$("#btnSaveAuto").onclick = () => run(() => api("/api/settings", {
+  auto_switch_minutes: Number($("#autoMinutes").value),
 }));
 
 $("#btnSaveRes").onclick = () => run(() => api("/api/settings", {

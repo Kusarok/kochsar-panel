@@ -11,6 +11,7 @@
 //! * [`discover`] -- reading the router's real network layout
 //! * [`dnsmasq`] -- pointing the LAN resolver at Xray
 //! * [`health`]  -- keeping the core alive, and unwinding when it cannot be
+//! * [`switcher`] -- automatic failover to the best-performing server
 //! * [`xray`]   -- config generation and process supervision
 //! * [`store`]  -- application state and its operations
 //! * [`api`]    -- HTTP panel and JSON API
@@ -30,6 +31,7 @@ mod net;
 mod parse;
 mod probe;
 mod store;
+mod switcher;
 mod tproxy;
 mod xray;
 
@@ -193,6 +195,7 @@ fn main() -> ExitCode {
     let app = Arc::new(Mutex::new(app));
     spawn_log_janitor(Arc::clone(&app));
     health::spawn(Arc::clone(&app));
+    switcher::spawn(Arc::clone(&app));
 
     if let Err(e) = api::serve(app, &args.listen, WORKERS) {
         eprintln!("xrayopd: {e}");

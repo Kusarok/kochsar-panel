@@ -71,7 +71,7 @@ pub fn measure(
     let nodes = &nodes[..nodes.len().min(MAX_NODES)];
 
     let ports = reserve_ports(nodes.len(), settings.probe_base_port)?;
-    let config = build_probe_config(nodes, &ports);
+    let config = build_probe_config(nodes, &ports, settings.route_router_traffic);
 
     // Same extension rule as the live config: Xray reads the format from it.
     let path = runtime_dir.join("probe.json");
@@ -123,7 +123,7 @@ fn reserve_ports(count: usize, base: u16) -> Result<Vec<u16>, String> {
 }
 
 /// A config whose only job is to expose one SOCKS port per node.
-fn build_probe_config(nodes: &[Node], ports: &[u16]) -> Value {
+fn build_probe_config(nodes: &[Node], ports: &[u16], marked: bool) -> Value {
     let mut inbounds = Vec::with_capacity(nodes.len());
     let mut outbounds = Vec::with_capacity(nodes.len() + 1);
     let mut rules = Vec::with_capacity(nodes.len());
@@ -140,7 +140,7 @@ fn build_probe_config(nodes: &[Node], ports: &[u16]) -> Value {
             // and both would cost memory per inbound for nothing.
             "settings": { "auth": "noauth", "udp": false }
         }));
-        outbounds.push(xray::probe_outbound(node, &outb));
+        outbounds.push(xray::probe_outbound(node, &outb, marked));
         rules.push(json!({ "type": "field", "inboundTag": [inb], "outboundTag": outb }));
     }
     // Anything unrouted is dropped rather than leaking out directly, which
@@ -289,7 +289,7 @@ mod tests {
     fn each_node_gets_its_own_port_and_route() {
         let ns = nodes(3);
         let ports = vec![24000, 24001, 24002];
-        let cfg = build_probe_config(&ns, &ports);
+        let cfg = build_probe_config(&ns, &ports, false);
 
         let inbounds = cfg["inbounds"].as_array().unwrap();
         assert_eq!(inbounds.len(), 3);
@@ -314,16 +314,30 @@ mod tests {
     /// a dead server report the latency of the router's own connection.
     #[test]
     fn unrouted_traffic_is_blocked_not_direct() {
-        let cfg = build_probe_config(&nodes(2), &[24000, 24001]);
+        let cfg = build_probe_config(&nodes(2), &[24000, 24001], false);
         let outs = cfg["outbounds"].as_array().unwrap();
         let last = outs.last().unwrap();
         assert_eq!(last["protocol"], "blackhole");
         assert!(!outs.iter().any(|o| o["protocol"] == "freedom"));
     }
 
+    /// With the router's own traffic tunnelled, an unmarked probe would be
+    /// intercepted and every server would report the latency of the one
+    /// already in use.
+    #[test]
+    fn probes_are_marked_when_the_router_tunnels_its_own_traffic() {
+        let marked = build_probe_config(&nodes(1), &[24000], true);
+        assert_eq!(
+            marked["outbounds"][0]["streamSettings"]["sockopt"]["mark"],
+            crate::tproxy::XRAY_MARK
+        );
+        let plain = build_probe_config(&nodes(1), &[24000], false);
+        assert!(plain["outbounds"][0]["streamSettings"].get("sockopt").is_none());
+    }
+
     #[test]
     fn probe_config_is_quiet() {
-        let cfg = build_probe_config(&nodes(1), &[24000]);
+        let cfg = build_probe_config(&nodes(1), &[24000], false);
         assert_eq!(cfg["log"]["loglevel"], "none");
         assert_eq!(cfg["log"]["access"], "none");
     }

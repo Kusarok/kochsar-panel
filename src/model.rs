@@ -287,6 +287,16 @@ pub struct Settings {
     /// Used when `test_target == "custom"`.
     #[serde(default)]
     pub test_url_custom: String,
+    /// Test every server on a schedule and move to the best one.
+    ///
+    /// Off by default: it restarts the core when it acts, and that is a
+    /// decision to opt into rather than inherit.
+    #[serde(default)]
+    pub auto_switch: bool,
+    /// Minutes between scheduled sweeps. A failing tunnel triggers one sooner
+    /// regardless -- see [`crate::switcher`].
+    #[serde(default = "d_auto_switch_minutes")]
+    pub auto_switch_minutes: u32,
     /// First port of the range the latency probe binds, one per node.
     #[serde(default = "d_probe_base_port")]
     pub probe_base_port: u16,
@@ -348,6 +358,11 @@ fn d_test_target() -> String {
 /// High and unremarkable; only ever bound on loopback and only during a sweep.
 fn d_probe_base_port() -> u16 {
     24000
+}
+/// Four hours. Long enough that the reconnects are unnoticeable, short enough
+/// that a server which decayed overnight is not still in use by morning.
+fn d_auto_switch_minutes() -> u32 {
+    240
 }
 
 
@@ -420,6 +435,8 @@ impl Default for Settings {
             test_target: d_test_target(),
             test_url_custom: String::new(),
             probe_base_port: d_probe_base_port(),
+            auto_switch: false,
+            auto_switch_minutes: d_auto_switch_minutes(),
         }
     }
 }

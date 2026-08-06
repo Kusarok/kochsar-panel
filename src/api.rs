@@ -149,6 +149,7 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
     let tproxy_applied = app.tproxy_applied;
     let dns_via_tunnel = app.dns_via_tunnel;
     let health = app.health.clone();
+    let switcher = app.switcher.clone();
     let state = &app.state;
 
     let nodes: Vec<Value> = state
@@ -212,6 +213,15 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
             "reachable": health.reachable,
             "probe_failures": health.probe_failures,
             "last_failure": health.last_failure,
+        },
+        "switcher": {
+            "enabled": state.settings.auto_switch,
+            "minutes": state.settings.auto_switch_minutes,
+            "switches": switcher.switches,
+            "last_switch": switcher.last_switch,
+            "last_switch_to": switcher.last_switch_to,
+            "last_switch_reason": switcher.last_switch_reason,
+            "last_sweep": switcher.last_sweep,
         },
         "tproxy": {
             "enabled": state.settings.transparent,
@@ -647,6 +657,19 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
             }
             next.dns_bypass_resolver = v.to_string();
         }
+    }
+    if let Some(raw) = body.get("auto_switch") {
+        next.auto_switch = raw.as_bool().ok_or("auto_switch must be true or false")?;
+    }
+    if let Some(raw) = body.get("auto_switch_minutes") {
+        let v = raw.as_u64().ok_or("auto_switch_minutes must be a number")?;
+        // A sweep briefly runs a second core and reconnects if it acts, so a
+        // one-minute interval would cost more than it saves. The upper bound is
+        // a week, past which it is not really automatic.
+        if !(5..=10080).contains(&v) {
+            return Err("the interval must be between 5 minutes and a week".into());
+        }
+        next.auto_switch_minutes = v as u32;
     }
     if let Some(raw) = body.get("probe_base_port") {
         next.probe_base_port = port_of(raw).ok_or("probe_base_port must be between 1 and 65535")?;

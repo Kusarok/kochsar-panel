@@ -182,9 +182,22 @@ if pgrep -f 'bin/xrayopd' >/dev/null; then
     echo "  Panel:  http://${LAN_IP}:${PORT:-8088}"
     echo "  Token:  ${TOKEN:-<check: logread | grep -A2 'panel token'>}"
     echo
-    echo "It starts in proxy mode: a SOCKS5 proxy on port 1080 and an HTTP proxy"
-    echo "on 1081, for clients you point at them. Add a subscription, pick a"
-    echo "server, then switch to global mode when you want the whole LAN."
+    # A reinstall keeps whatever mode was already set, so only describe the
+    # starting point when this really is one.
+    MODE="$(sed -n 's/.*"mode": "\([a-z]*\)".*//p' "$STATE_DIR/state.json" 2>/dev/null)"
+    case "${MODE:-proxy}" in
+        global)
+            echo "Restored in global mode: the whole LAN goes through the tunnel."
+            ;;
+        off)
+            echo "Restored with the tunnel switched off."
+            ;;
+        *)
+            echo "Running in proxy mode: a SOCKS5 proxy on port 1080 and an HTTP"
+            echo "proxy on 1081, for clients you point at them. Add a subscription,"
+            echo "pick a server, then switch to global mode for the whole LAN."
+            ;;
+    esac
 else
     echo "Installed, but the service did not start. What it said:"
     logread | grep -i xrayop | tail -5

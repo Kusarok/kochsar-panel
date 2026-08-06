@@ -43,6 +43,8 @@ pub struct App {
     pub dns_via_tunnel: bool,
     /// Liveness counters kept by [`crate::health`].
     pub health: crate::health::Status,
+    /// Automatic-failover counters kept by [`crate::switcher`].
+    pub switcher: crate::switcher::Status,
     /// Set while a latency sweep is running, so a user hammering "test all"
     /// cannot pin every worker thread at once.
     pub probing: Arc<AtomicBool>,
@@ -92,6 +94,7 @@ impl App {
             tproxy_applied: false,
             dns_via_tunnel: false,
             health: crate::health::Status::default(),
+            switcher: crate::switcher::Status::default(),
             probing: Arc::new(AtomicBool::new(false)),
             state_path,
         };
