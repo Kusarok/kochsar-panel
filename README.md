@@ -7,10 +7,12 @@ Written in Rust. The daemon is a **~870 KB static binary** using **under 1 MB of
 RAM** on the target router; the whole stack measured 38.6 MB against Passwall2's
 51.2 MB carrying the same traffic.
 
-> **Status: working, not yet battle-tested.** The SOCKS/HTTP path is in daily
-> use. Transparent proxying and tunnelled DNS are written, kernel-validated and
-> wired to the panel, but have **never been applied to a live router** — the
-> first enable should happen with physical access to the device.
+> **Status: running in global mode on the author's router.** Transparent
+> proxying and tunnelled DNS carry a real LAN; crash recovery, the WAN-reconnect
+> hook and the installer have all been exercised on the device. What is *not*
+> established is long-run behaviour: the longest continuous observation is under
+> an hour at low traffic, and the failure that matters most on a router — UDP
+> socket accumulation under TPROXY — only appears after hours of heavy use.
 
 ---
 
@@ -41,18 +43,23 @@ cycle, and the UI is whatever we want it to be rather than whatever CBI renders.
   that dies on startup is reported as a failure with the reason, not silently
   shown as connected.
 
-- **Transparent proxy** — nftables TPROXY for the LAN, with tunnelled DNS, an
-  apply-then-confirm handshake and an automatic rollback. Written and validated;
-  see the section below before enabling it.
+- **Three modes** — `off` stops the core entirely, so nothing this daemon does
+  can affect connectivity; `proxy` serves SOCKS/HTTP for clients that opt in;
+  `global` intercepts the LAN with nftables TPROXY and tunnelled DNS, behind an
+  apply-then-confirm handshake with automatic rollback.
+- **The router's own traffic** — optional, off by default.
+- **Supervision that gives up correctly** — a dead core is restarted; one that
+  cannot be kept running has its rules torn down so the LAN falls back to a
+  direct connection, and they are restored when it recovers.
+- **Discovery** — LAN interfaces, the bypass resolver and the xray binary are
+  read from the router rather than assumed, so this is not tied to one layout.
 
 ## What it does not do yet
 
-- The router's **own** outbound traffic is not intercepted — only LAN clients.
 - IPv6 is left direct.
 - VLESS only. VMess, Trojan, Shadowsocks and Hysteria links are counted as
   "unsupported" on import rather than parsed.
-- Rules are not re-applied automatically after `fw4 reload`; the panel detects
-  the drift and says so, but reinstating them is manual.
+- No long-run stability data. See the status note above.
 
 ---
 
