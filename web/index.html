@@ -187,6 +187,9 @@ label{display:block; font-size:12px; color:var(--muted); margin-bottom:7px}
 .ms{font-variant-numeric:tabular-nums; font-size:13px; font-weight:600; min-width:60px; text-align:center; flex:none}
 .ms.g{color:var(--ok)} .ms.y{color:var(--warn)} .ms.r{color:var(--bad)} .ms.n{color:var(--muted)}
 .tag{font-size:10px; padding:3px 8px; border-radius:7px; color:var(--muted); background:var(--accent-soft); letter-spacing:.4px}
+/* What the server is. Every node has one, so it stays quieter than the tags
+   that only some nodes carry. */
+.tag.proto{background:transparent; box-shadow:inset 2px 2px 4px var(--sh-dark), inset -2px -2px 4px var(--sh-light); white-space:nowrap}
 
 .grid{display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:12px}
 .dns{
@@ -331,8 +334,8 @@ pre.log{
     <div class="card" id="addNodeBox" hidden>
       <h2 data-t="addByLink">Add by link</h2>
       <div class="field">
-        <label data-t="pasteLinks">Paste vless:// links, one per line, or a base64 blob</label>
-        <textarea id="nodeText" dir="ltr" placeholder="vless://uuid@host:443?security=reality&amp;pbk=...#name"></textarea>
+        <label data-t="pasteLinks">Paste share links, one per line, or a base64 blob</label>
+        <textarea id="nodeText" dir="ltr" placeholder="vless://  vmess://  trojan://  ss://  hysteria2://  wireguard://  socks://"></textarea>
       </div>
       <div class="row">
         <button class="btn pri" id="btnSaveNode" data-t="add">Add</button>
@@ -588,7 +591,7 @@ const I18N = {
     testAll:"Test all", fastest:"Fastest", add:"Add", cancel:"Cancel", save:"Save",
     apply:"Apply", enable:"Enable", disable:"Disable", revert:"Revert", remove:"Delete",
     refresh:"Refresh", refreshAll:"Refresh all", addFetch:"Add and fetch",
-    addByLink:"Add by link", pasteLinks:"Paste vless:// links, one per line, or a base64 blob",
+    addByLink:"Add by link", pasteLinks:"Paste share links, one per line, or a base64 blob",
     noNodes:"No servers yet. Add one from Settings › Subscriptions, or paste a link.",
     noSubs:"No subscriptions yet.",
     appearance:"Language", language:"Interface language",
@@ -658,7 +661,7 @@ const I18N = {
     testAll:"تست همه", fastest:"سریع‌ترین", add:"افزودن", cancel:"انصراف", save:"ذخیره",
     apply:"اعمال", enable:"فعال‌سازی", disable:"غیرفعال‌سازی", revert:"برگرداندن", remove:"حذف",
     refresh:"به‌روزرسانی", refreshAll:"به‌روزرسانی همه", addFetch:"افزودن و دریافت",
-    addByLink:"افزودن با لینک", pasteLinks:"لینک‌های ‎vless://‎ را بچسبانید — هر خط یکی، یا متن base64",
+    addByLink:"افزودن با لینک", pasteLinks:"لینک‌های اشتراکی را بچسبانید — هر خط یکی، یا متن base64",
     noNodes:"هنوز سروری نیست. از تنظیمات ‹ اشتراک‌ها اضافه کنید یا یک لینک بچسبانید.",
     noSubs:"هیچ اشتراکی ثبت نشده.",
     appearance:"زبان", language:"زبان رابط کاربری",
@@ -862,6 +865,20 @@ function startUptime(startedAt) {
   uptimeTimer = setInterval(tick, 1000);
 }
 
+/* Short label for a node: the protocol, plus the transport when it is not the
+   protocol's own. WireGuard and Hysteria2 carry no separate transport, and
+   showing "wireguard/" would be noise. */
+const PROTO_SHORT = {
+  vless: "VLESS", vmess: "VMess", trojan: "Trojan", shadowsocks: "SS",
+  hysteria2: "HY2", wireguard: "WG", socks: "SOCKS",
+};
+function protoLabel(n) {
+  const p = PROTO_SHORT[n.protocol] || (n.protocol || "VLESS").toUpperCase();
+  const carriesTransport = !["wireguard", "hysteria2", "socks"].includes(n.protocol);
+  if (carriesTransport && n.network && n.network !== "tcp") return p + " · " + n.network;
+  return p;
+}
+
 function renderNodes() {
   const box = $("#nodeList");
   box.replaceChildren();
@@ -880,6 +897,9 @@ function renderNodes() {
     info.appendChild(text(el("div", "nm"), n.name));
     info.appendChild(text(el("div", "sub ltr"), n.server + ":" + n.port));
     row.appendChild(info);
+    // What the server actually is. Two nodes on the same host can be a Trojan
+    // and a VLESS account, and without this they look identical.
+    row.appendChild(text(el("span", "tag proto"), protoLabel(n)));
     if (n.security === "reality") row.appendChild(el("span", "tag", "REALITY"));
     if (n.sub_id && subName[n.sub_id]) row.appendChild(text(el("span", "tag"), subName[n.sub_id]));
     row.appendChild(latency(n.latency));

@@ -158,6 +158,7 @@ fn handle_state(app: &Arc<Mutex<App>>) -> Body {
             json!({
                 "id": n.id,
                 "name": n.name,
+                "protocol": n.protocol,
                 "server": n.server,
                 "port": n.port,
                 "network": n.network,
@@ -312,7 +313,7 @@ fn fetch_and_merge(app: &Arc<Mutex<App>>, id: &str) -> Result<SubSummary, String
             .errors
             .first()
             .cloned()
-            .unwrap_or_else(|| "no VLESS links found in the response".into());
+            .unwrap_or_else(|| "no supported share links found in the response".into());
         return Err(detail);
     }
     Ok(summary)
@@ -339,7 +340,7 @@ fn handle_nodes_add(app: &Arc<Mutex<App>>, body: &Value) -> Body {
             .errors
             .first()
             .cloned()
-            .unwrap_or_else(|| "no VLESS links found".into());
+            .unwrap_or_else(|| "no supported share links found".into());
         return error(400, &detail);
     }
     finish_write(app, summary_json(&summary, 0))
@@ -1268,7 +1269,7 @@ mod tests {
         .unwrap();
         let listed = json!({
             "id": n.id, "name": n.name, "server": n.server, "port": n.port,
-            "network": n.network, "security": n.security, "flow": n.flow,
+            "protocol": n.protocol, "network": n.network, "security": n.security, "flow": n.flow,
             "sub_id": n.sub_id, "latency": n.latency, "active": false,
         });
         for key in listed.as_object().unwrap().keys() {
@@ -1508,6 +1509,45 @@ mod tests {
             INDEX_HTML.contains("status.version"),
             "the panel must show the version the daemon reports"
         );
+    }
+
+    /// The panel used to name VLESS in its own text and tag only REALITY, so a
+    /// Trojan node and a VLESS node on one host were indistinguishable. It now
+    /// shows what each server is, which means it has to be told.
+    #[test]
+    fn the_panel_is_told_what_protocol_each_node_is() {
+        assert!(
+            INDEX_HTML.contains("protoLabel"),
+            "the node list must show the protocol"
+        );
+        // Every scheme the parser accepts needs a label, or it renders as a
+        // bare uppercase string.
+        for p in crate::parse::SCHEMES {
+            let name = p.trim_end_matches("://");
+            if matches!(name, "hy2" | "socks5") {
+                continue; // aliases; they parse to the canonical name
+            }
+            assert!(
+                INDEX_HTML.contains(&format!("{name}:")),
+                "no panel label for {name}"
+            );
+        }
+    }
+
+    /// Text that names one protocol goes stale the moment another is added.
+    #[test]
+    fn user_facing_text_does_not_single_out_vless() {
+        for (n, line) in INDEX_HTML.lines().enumerate() {
+            // The placeholder listing every scheme is the one legitimate use.
+            if line.contains("placeholder") {
+                continue;
+            }
+            assert!(
+                !line.to_lowercase().contains("vless://"),
+                "line {} still tells the user about vless in particular: {line}",
+                n + 1
+            );
+        }
     }
 
     #[test]
