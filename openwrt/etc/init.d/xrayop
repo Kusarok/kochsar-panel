@@ -52,6 +52,33 @@ start_service() {
 	procd_close_instance
 }
 
+stop_service() {
+	# nftables rules outlive the process that made them. Leaving them loaded
+	# while the daemon is stopped points every LAN packet at a port with
+	# nothing behind it -- the LAN loses the internet and stays that way until
+	# something restarts the service.
+	#
+	# Taking them down here means a stopped service fails safe: traffic goes
+	# direct. The daemon puts them back on start when the mode calls for it.
+	nft delete table inet xrayop 2>/dev/null
+
+	local fam
+	for fam in -4 -6; do
+		while ip $fam rule del fwmark 494 table 494 2>/dev/null; do :; done
+	done
+	ip -4 route del local 0.0.0.0/0 dev lo table 494 2>/dev/null
+	ip -6 route del local ::/0 dev lo table 494 2>/dev/null
+
+	# Hand DNS back, or the LAN keeps asking a resolver that is not answering.
+	local dropped=0 f
+	for f in /tmp/dnsmasq.*.d/zz-xrayop.conf /var/dnsmasq.*.d/zz-xrayop.conf; do
+		[ -f "$f" ] && { rm -f "$f"; dropped=1; }
+	done
+	[ "$dropped" = 1 ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1
+
+	return 0
+}
+
 service_triggers() {
 	procd_add_reload_trigger "xrayop"
 }

@@ -11,3 +11,6 @@ state.json.bak
 
 # Claude Code local tool permissions, per-machine.
 .claude/settings.local.json
+
+# Release artefacts are rebuilt from source.
+/dist

@@ -210,21 +210,43 @@ Adjust `TARGET` for other routers — `aarch64-unknown-linux-musl` for ARM64,
 
 ## Install
 
-```bash
-ROUTER=router ./scripts/deploy.sh
-```
-
-That installs the binary, the procd service and a default `/etc/config/xrayop`,
-enables the service and starts it. Then open `http://<router>:8088`.
-
-Manually:
+Build a release tarball, copy it over, run the installer:
 
 ```bash
-cat dist/xrayopd | ssh root@router 'cat > /usr/bin/xrayopd && chmod +x /usr/bin/xrayopd'
+./scripts/release.sh
 ```
 
-OpenWrt's dropbear has no sftp-server, so `scp` fails — pipe through `ssh`
-instead.
+```bash
+scp -O dist/xrayop-*.tar.gz root@ROUTER:/tmp/
+ssh root@ROUTER 'cd /tmp && tar xzf xrayop-*.tar.gz && cd xrayop-*/ && sh install.sh'
+```
+
+`scp` needs `-O` because OpenWrt's dropbear ships without sftp-server. Piping
+through `ssh` works too: `cat file | ssh root@ROUTER 'cat > /tmp/file'`.
+
+The installer checks the router before touching anything and reports every
+problem at once rather than failing partway through with the service already
+enabled: OpenWrt and CPU match, xray-core present, `nft_tproxy` and
+`nft_socket` loadable, dnsmasq running, curl present, flow offloading off (it
+short-circuits the hooks global mode uses), and whether another proxy package
+is currently intercepting.
+
+It also adds itself to `/etc/sysupgrade.conf`, since the default backup covers
+only `/etc/config` and would leave the server list and the service behind.
+
+When it finishes it prints the panel URL and the token. First run comes up in
+proxy mode, which changes nothing about how the router routes.
+
+To remove it: `sh uninstall.sh`, or `--purge` to drop the server list too. It
+takes the firewall rules and the resolver hand-off down *before* stopping the
+service, in that order — the reverse would leave the LAN redirected at a port
+with nothing behind it.
+
+### Developing
+
+`./scripts/build.sh --fetch` builds on a remote Linux host and downloads the
+binary; `./scripts/deploy.sh` pushes it to a router without rebuilding the
+whole package.
 
 ### Configuration
 
