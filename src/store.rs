@@ -574,10 +574,10 @@ mod tests {
     #[test]
     fn manual_import_reports_bad_lines() {
         let mut app = app();
-        let s = app.add_nodes_from_text(&format!("{A}\nvless://broken\nwireguard://k@h:1#w"));
+        let s = app.add_nodes_from_text(&format!("{A}\nvless://broken\ntuic://k@h:1#t"));
         assert_eq!(s.imported, 1);
         assert_eq!(s.errors.len(), 1);
-        assert_eq!(s.skipped, 1, "wireguard is not spoken yet");
+        assert_eq!(s.skipped, 1, "tuic has no Xray outbound at all");
     }
 
     fn app_at(dir: &std::path::Path) -> App {

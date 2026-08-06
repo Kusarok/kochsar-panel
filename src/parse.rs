@@ -31,11 +31,40 @@ pub fn parse_uri(uri: &str) -> Result<Node, String> {
     if let Some(rest) = uri.strip_prefix("ss://") {
         return parse_ss(uri, rest);
     }
+    for p in ["hysteria2://", "hy2://"] {
+        if let Some(rest) = uri.strip_prefix(p) {
+            return parse_hysteria2(uri, rest);
+        }
+    }
+    if let Some(rest) = uri.strip_prefix("wireguard://") {
+        return parse_wireguard(uri, rest);
+    }
+    for p in ["socks5://", "socks://"] {
+        if let Some(rest) = uri.strip_prefix(p) {
+            return parse_socks(uri, rest);
+        }
+    }
     parse_vless(uri)
 }
 
 /// Every scheme [`parse_uri`] understands, for the subscription splitter.
-pub const SCHEMES: &[&str] = &["vless://", "vmess://", "trojan://", "ss://"];
+///
+/// Everything here runs on the Xray core the router already has. TUIC and
+/// Hysteria v1 are deliberately absent: Xray has no TUIC outbound at all, and
+/// rejects Hysteria unless the version is 2. Supporting them would mean
+/// shipping a second core, which on this hardware costs more memory than the
+/// whole rest of the stack.
+pub const SCHEMES: &[&str] = &[
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+    "hysteria2://",
+    "hy2://",
+    "wireguard://",
+    "socks5://",
+    "socks://",
+];
 
 fn parse_vless(uri: &str) -> Result<Node, String> {
     let body = uri
@@ -136,6 +165,8 @@ fn apply_stream_params(node: &mut Node, q: &Query) {
     };
     node.mode = q.get("mode");
     node.header_type = q.get("headerType");
+    node.authority = q.get("authority");
+    node.xhttp_extra = q.get("extra");
     node.allow_insecure = {
         // Three spellings are in circulation; generators disagree.
         let a = ["allowInsecure", "insecure", "allow_insecure"]
@@ -417,6 +448,130 @@ fn parse_ss(uri: &str, rest: &str) -> Result<Node, String> {
     Ok(node)
 }
 
+/// `hysteria2://<password>@<host>:<port>?<query>#<remark>`
+///
+/// QUIC-only, and TLS is not optional -- Xray's dialer refuses to start
+/// without it. The password does not live in `settings` like every other
+/// protocol's does; it goes in `hysteriaSettings.auth`.
+fn parse_hysteria2(uri: &str, rest: &str) -> Result<Node, String> {
+    let (authority, query, fragment) = split_link(rest);
+    let (password, hostport) = authority
+        .rsplit_once('@')
+        .ok_or_else(|| "missing '@' between password and host".to_string())?;
+    let (server, port) = split_host_port(hostport)?;
+    let q = Query::parse(query);
+
+    let mut node = Node {
+        protocol: "hysteria2".into(),
+        server,
+        port,
+        password: decode(password),
+        network: "hysteria".into(),
+        security: "tls".into(),
+        sni: q.get("sni"),
+        fingerprint: q.get("fp"),
+        // Forced, not taken from the link: Xray runs Hysteria2 over HTTP/3 and
+        // any other ALPN is a handshake that cannot succeed.
+        alpn: "h3".into(),
+        obfs: q.get("obfs"),
+        obfs_password: q.get("obfs-password"),
+        port_hopping: q.get("mport"),
+        pinned_peer_cert_sha256: q.get("pinSHA256"),
+        raw: uri.to_string(),
+        ..Default::default()
+    };
+    node.allow_insecure = matches!(q.get("insecure").as_str(), "1" | "true");
+    node.name = remark(fragment, &node);
+
+    validate(&node)?;
+    node.id = node.compute_id();
+    Ok(node)
+}
+
+/// `wireguard://<secretKey>@<host>:<port>?publickey=..&address=..#<remark>`
+///
+/// There is no transport and no TLS here; WireGuard is its own thing. What
+/// does still apply is `sockopt`, which is how the tunnel's own packets carry
+/// our mark and escape interception.
+fn parse_wireguard(uri: &str, rest: &str) -> Result<Node, String> {
+    let (authority, query, fragment) = split_link(rest);
+    let (secret, hostport) = authority
+        .rsplit_once('@')
+        .ok_or_else(|| "missing '@' between key and endpoint".to_string())?;
+    let (server, port) = split_host_port(hostport)?;
+    let q = Query::parse(query);
+
+    let mut node = Node {
+        protocol: "wireguard".into(),
+        server,
+        port,
+        secret_key: decode(secret),
+        // Query keys are all-lowercase in this scheme, unlike every other.
+        peer_public_key: q.get("publickey"),
+        pre_shared_key: q.get("presharedkey"),
+        local_address: q.get("address"),
+        reserved: q.get("reserved"),
+        mtu: q.get("mtu").parse().unwrap_or(0),
+        network: String::new(),
+        security: "none".into(),
+        raw: uri.to_string(),
+        ..Default::default()
+    };
+    node.name = remark(fragment, &node);
+
+    validate(&node)?;
+    node.id = node.compute_id();
+    Ok(node)
+}
+
+/// `socks://[<userinfo>@]<host>:<port>#<remark>`
+///
+/// No encryption of any kind, so this is only useful for chaining to something
+/// already on the local network. `socks4://` is deliberately not accepted:
+/// Xray's client always speaks SOCKS5, so importing one would be a promise the
+/// core cannot keep.
+fn parse_socks(uri: &str, rest: &str) -> Result<Node, String> {
+    let (authority, _query, fragment) = split_link(rest);
+    let (userinfo, hostport) = match authority.rsplit_once('@') {
+        Some((u, h)) => (u, h),
+        None => ("", authority),
+    };
+    let (server, port) = split_host_port(hostport)?;
+
+    let (username, password) = if userinfo.is_empty() {
+        (String::new(), String::new())
+    } else {
+        let creds = decode(userinfo);
+        // Either plaintext `user:pass`, or base64 of the same.
+        let creds = if creds.contains(':') {
+            creds
+        } else {
+            decode_base64(&creds).unwrap_or(creds)
+        };
+        match creds.split_once(':') {
+            Some((u, p)) => (u.to_string(), p.to_string()),
+            None => (creds, String::new()),
+        }
+    };
+
+    let mut node = Node {
+        protocol: "socks".into(),
+        server,
+        port,
+        username,
+        password,
+        network: "tcp".into(),
+        security: "none".into(),
+        raw: uri.to_string(),
+        ..Default::default()
+    };
+    node.name = remark(fragment, &node);
+
+    validate(&node)?;
+    node.id = node.compute_id();
+    Ok(node)
+}
+
 /// Splits `<authority>[?query][#fragment]`, fragment first so a remark may
 /// legitimately contain `?` or `@`.
 fn split_link(rest: &str) -> (&str, &str, &str) {
@@ -468,6 +623,51 @@ fn decode_base64(s: &str) -> Option<String> {
 ///
 /// Line references are to Xray-core 26.x `infra/conf/`.
 fn validate(node: &Node) -> Result<(), String> {
+    // Two protocols do not use the stream transports at all, so the checks
+    // below do not apply to them.
+    if node.protocol == "wireguard" {
+        if node.secret_key.is_empty() {
+            return Err("wireguard link has no private key".into());
+        }
+        if node.peer_public_key.is_empty() {
+            return Err("wireguard link has no publickey for the peer".into());
+        }
+        // Xray takes 64-char hex, standard base64 or base64url, padded or not.
+        for (what, key) in [
+            ("private key", &node.secret_key),
+            ("publickey", &node.peer_public_key),
+        ] {
+            if !is_wg_key(key) {
+                return Err(format!("wireguard {what} is not a 32-byte key"));
+            }
+        }
+        let n = node.reserved.split(',').filter(|p| !p.trim().is_empty()).count();
+        if n != 0 && n != 3 {
+            return Err("wireguard reserved must be exactly three numbers".into());
+        }
+        return Ok(());
+    }
+    if node.protocol == "hysteria2" {
+        if node.password.is_empty() {
+            return Err("hysteria2 link has no password".into());
+        }
+        if !node.obfs.is_empty() && node.obfs != "salamander" {
+            return Err(format!(
+                "hysteria2 obfuscation \"{}\" is not one Xray implements; only salamander is",
+                node.obfs
+            ));
+        }
+        return Ok(());
+    }
+    if node.protocol == "socks" {
+        // A username with no password is meaningless to Xray's client: it
+        // sends both or neither.
+        if !node.username.is_empty() && node.password.is_empty() {
+            return Err("socks link has a username but no password".into());
+        }
+        return Ok(());
+    }
+
     // Removed transports. Xray answers these with PrintRemovedFeatureError.
     match node.network.as_str() {
         "h2" | "http" | "h3" => {
@@ -570,6 +770,17 @@ fn validate(node: &Node) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Whether a string is a 32-byte WireGuard key in any form Xray accepts.
+fn is_wg_key(s: &str) -> bool {
+    if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return true;
+    }
+    decode_base64(s).map(|_| ()).is_some()
+        && s.trim_end_matches('=').len() == 43
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '-' | '_' | '='))
 }
 
 /// Decoded length of an unpadded base64url string, or `None` if it is not one.
@@ -1127,12 +1338,12 @@ mod tests {
     fn plain_subscription_reports_unsupported_and_bad_lines() {
         let body = "vless://u@a.com:443#ok\n\
                     trojan://pw@b.com:443#also-ok\n\
-                    hysteria2://pw@c.com:443#not-yet\n\
+                    tuic://pw@c.com:443#no-xray-support\n\
                     # a comment\n\
                     vless://broken";
         let r = parse_subscription(body);
         assert_eq!(r.nodes.len(), 2, "vless and trojan both import");
-        assert_eq!(r.skipped, 1, "hysteria2 is not spoken yet");
+        assert_eq!(r.skipped, 1, "tuic has no Xray outbound at all");
         assert_eq!(r.errors.len(), 1, "broken vless line");
         assert_eq!(r.errors[0].0, 5, "error should carry the 1-based line number");
     }

@@ -40,6 +40,48 @@ pub struct Node {
     /// Shadowsocks cipher, or the VMess `security` (its `scy` field).
     #[serde(default)]
     pub method: String,
+    /// SOCKS username. The password shares the `password` field above.
+    #[serde(default)]
+    pub username: String,
+
+    // --- hysteria2 ---
+    /// Salamander obfuscation, the only kind Hysteria2 defines.
+    #[serde(default)]
+    pub obfs: String,
+    #[serde(default)]
+    pub obfs_password: String,
+    /// `mport`: a port range the client hops across, e.g. `20000-50000`.
+    #[serde(default)]
+    pub port_hopping: String,
+
+    // --- wireguard ---
+    /// Our own private key.
+    #[serde(default)]
+    pub secret_key: String,
+    /// The peer's public key. Deliberately not `public_key`, which is
+    /// REALITY's `pbk`: they never appear together, but one field read for two
+    /// unrelated purposes is the kind of thing that survives a refactor.
+    #[serde(default)]
+    pub peer_public_key: String,
+    #[serde(default)]
+    pub pre_shared_key: String,
+    /// Comma-separated addresses for our end of the tunnel.
+    #[serde(default)]
+    pub local_address: String,
+    /// Comma-separated three bytes some providers require.
+    #[serde(default)]
+    pub reserved: String,
+    /// 0 means "let Xray choose", which is 1420.
+    #[serde(default)]
+    pub mtu: u32,
+
+    /// gRPC `authority`, and the SNI it falls back to.
+    #[serde(default)]
+    pub authority: String,
+    /// Raw JSON object for `xhttpSettings.extra` -- the escape hatch for xmux
+    /// and padding knobs a share link cannot otherwise express.
+    #[serde(default)]
+    pub xhttp_extra: String,
 
     // --- stream settings ---
     /// `tcp` | `ws` | `grpc` | `xhttp` | `httpupgrade`
@@ -146,6 +188,18 @@ impl Default for Node {
             encryption: d_none(),
             password: String::new(),
             method: String::new(),
+            username: String::new(),
+            obfs: String::new(),
+            obfs_password: String::new(),
+            port_hopping: String::new(),
+            secret_key: String::new(),
+            peer_public_key: String::new(),
+            pre_shared_key: String::new(),
+            local_address: String::new(),
+            reserved: String::new(),
+            mtu: 0,
+            authority: String::new(),
+            xhttp_extra: String::new(),
             network: d_tcp(),
             security: d_none(),
             sni: String::new(),

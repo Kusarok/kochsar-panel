@@ -268,6 +268,11 @@ fn protocol_name(node: &Node) -> &str {
         "vmess" => "vmess",
         "trojan" => "trojan",
         "shadowsocks" => "shadowsocks",
+        // Xray calls the outbound `hysteria` and takes the version as a field;
+        // there is no `hysteria2` protocol name.
+        "hysteria2" => "hysteria",
+        "wireguard" => "wireguard",
+        "socks" => "socks",
         _ => "vless",
     }
 }
@@ -314,6 +319,67 @@ fn build_settings(node: &Node) -> Value {
                 "level": 0
             }]
         }),
+        // The password is *not* here -- it lives in hysteriaSettings.auth,
+        // which is the one protocol that keeps its credential in the transport.
+        "hysteria" => json!({
+            "address": node.server,
+            "port": node.port,
+            "version": 2
+        }),
+        "wireguard" => {
+            let mut s = Map::new();
+            s.insert("secretKey".into(), json!(node.secret_key));
+            let addrs = csv(&node.local_address);
+            s.insert(
+                "address".into(),
+                // Xray's own default is a bogon pair; a link that omits this
+                // almost always means the usual single address.
+                json!(if addrs.is_empty() {
+                    vec!["172.16.0.2/32"]
+                } else {
+                    addrs
+                }),
+            );
+            let mut peer = Map::new();
+            peer.insert("publicKey".into(), json!(node.peer_public_key));
+            peer.insert(
+                "endpoint".into(),
+                json!(format!("{}:{}", node.server, node.port)),
+            );
+            if !node.pre_shared_key.is_empty() {
+                peer.insert("preSharedKey".into(), json!(node.pre_shared_key));
+            }
+            s.insert("peers".into(), json!([Value::Object(peer)]));
+            if node.mtu > 0 {
+                s.insert("mtu".into(), json!(node.mtu));
+            }
+            let reserved: Vec<u8> = csv(&node.reserved)
+                .iter()
+                .filter_map(|p| p.parse().ok())
+                .collect();
+            if reserved.len() == 3 {
+                s.insert("reserved".into(), json!(reserved));
+            }
+            // Load-bearing on a router. Running as root, Xray would otherwise
+            // take its kernel-TUN path: it writes 0 to rp_filter, creates a
+            // real wg interface, and installs its own routes and ip rules --
+            // on top of the policy routing our transparent proxy depends on.
+            // The userspace netstack keeps all of that inside the process.
+            s.insert("noKernelTun".into(), json!(true));
+            Value::Object(s)
+        }
+        "socks" => {
+            let mut server = Map::new();
+            server.insert("address".into(), json!(node.server));
+            server.insert("port".into(), json!(node.port));
+            if !node.username.is_empty() {
+                server.insert(
+                    "users".into(),
+                    json!([{ "user": node.username, "pass": node.password, "level": 0 }]),
+                );
+            }
+            json!({ "servers": [Value::Object(server)] })
+        }
         _ => json!({
             "vnext": [{
                 "address": node.server,
@@ -336,6 +402,59 @@ fn build_user(node: &Node) -> Value {
 }
 
 fn build_stream(node: &Node) -> Value {
+    // WireGuard carries no transport and no TLS. It still gets a
+    // streamSettings object, because `sockopt` lives there and the mark that
+    // keeps our own packets out of the tunnel is the one thing it does need.
+    if node.protocol == "wireguard" {
+        return Value::Object(Map::new());
+    }
+
+    if node.protocol == "hysteria2" {
+        let mut s = Map::new();
+        s.insert("network".into(), json!("hysteria"));
+        // Not optional: Xray's Hysteria dialer fails with "tls config is nil".
+        s.insert("security".into(), json!("tls"));
+        s.insert(
+            "hysteriaSettings".into(),
+            json!({ "version": 2, "auth": node.password }),
+        );
+        let mut t = Map::new();
+        t.insert("serverName".into(), json!(server_name(node)));
+        t.insert("alpn".into(), json!(["h3"]));
+        if !node.fingerprint.is_empty() {
+            t.insert("fingerprint".into(), json!(node.fingerprint));
+        }
+        if !node.pinned_peer_cert_sha256.is_empty() {
+            t.insert(
+                "pinnedPeerCertSha256".into(),
+                json!(csv(&node.pinned_peer_cert_sha256)),
+            );
+        }
+        s.insert("tlsSettings".into(), Value::Object(t));
+
+        // Obfuscation and port hopping are not settings of the transport; Xray
+        // puts both under finalmask, and the deprecated in-transport spellings
+        // are ignored with only a warning.
+        let mut mask = Map::new();
+        if node.obfs == "salamander" && !node.obfs_password.is_empty() {
+            mask.insert(
+                "udp".into(),
+                json!([{ "type": "salamander",
+                         "settings": { "password": node.obfs_password } }]),
+            );
+        }
+        if !node.port_hopping.is_empty() {
+            mask.insert(
+                "quicParams".into(),
+                json!({ "udpHop": { "ports": node.port_hopping, "interval": "30" } }),
+            );
+        }
+        if !mask.is_empty() {
+            s.insert("finalmask".into(), Value::Object(mask));
+        }
+        return Value::Object(s);
+    }
+
     let mut stream = Map::new();
     stream.insert("network".into(), json!(node.network));
     stream.insert("security".into(), json!(non_empty(&node.security, "none")));
@@ -343,7 +462,7 @@ fn build_stream(node: &Node) -> Value {
     match node.security.as_str() {
         "reality" => {
             let mut r = Map::new();
-            r.insert("serverName".into(), json!(node.sni));
+            r.insert("serverName".into(), json!(server_name(node)));
             r.insert("publicKey".into(), json!(node.public_key));
             r.insert("shortId".into(), json!(node.short_id));
             r.insert("spiderX".into(), json!(non_empty(&node.spider_x, "/")));
@@ -363,16 +482,7 @@ fn build_stream(node: &Node) -> Value {
         }
         "tls" => {
             let mut t = Map::new();
-            // Fall back to the Host header, then the address, mirroring what
-            // clients do when a link omits `sni`.
-            let sni = if !node.sni.is_empty() {
-                &node.sni
-            } else if !node.host.is_empty() {
-                &node.host
-            } else {
-                &node.server
-            };
-            t.insert("serverName".into(), json!(sni));
+            t.insert("serverName".into(), json!(server_name(node)));
             // `allowInsecure` is deliberately never written. Xray removed it,
             // and removed here means the config does not load at all -- a
             // single link carrying `insecure=1` would stop the core, taking
@@ -419,6 +529,13 @@ fn build_stream(node: &Node) -> Value {
             let mut g = Map::new();
             g.insert("serviceName".into(), json!(node.service_name));
             g.insert("multiMode".into(), json!(node.mode == "multi"));
+            if !node.authority.is_empty() {
+                g.insert("authority".into(), json!(node.authority));
+            }
+            // Xray spells these two in snake_case, unlike everything around
+            // them. Values match what other clients send.
+            g.insert("idle_timeout".into(), json!(60));
+            g.insert("health_check_timeout".into(), json!(20));
             stream.insert("grpcSettings".into(), Value::Object(g));
         }
         "xhttp" | "splithttp" => {
@@ -428,6 +545,21 @@ fn build_stream(node: &Node) -> Value {
                 x.insert("host".into(), json!(node.host));
             }
             x.insert("mode".into(), json!(non_empty(&node.mode, "auto")));
+            // The escape hatch for xmux and the padding knobs a share link
+            // cannot otherwise express. Embedded verbatim, but only if it is
+            // really a JSON object -- Xray refuses the whole config over a
+            // malformed one, and losing a tuning parameter beats that.
+            if !node.xhttp_extra.is_empty() {
+                match serde_json::from_str::<Value>(&node.xhttp_extra) {
+                    Ok(v) if v.is_object() => {
+                        x.insert("extra".into(), v);
+                    }
+                    _ => eprintln!(
+                        "xrayop: ignoring the `extra` parameter on \"{}\": not a JSON object",
+                        node.name
+                    ),
+                }
+            }
             stream.insert("xhttpSettings".into(), Value::Object(x));
         }
         "httpupgrade" => {
@@ -515,6 +647,59 @@ fn non_empty<'a>(v: &'a str, default: &'a str) -> &'a str {
     } else {
         v
     }
+}
+
+/// The name to present in SNI, when the link did not say.
+///
+/// An empty `serverName` is not neutral: Xray fills it with the destination
+/// address, so a server addressed by IP ends up announcing that IP in the
+/// handshake, which REALITY and most TLS front-ends reject. Something
+/// plausible has to be chosen.
+///
+/// The order is the one other clients settled on. Each transport carries a
+/// host of its own -- gRPC in `authority`, the rest in `host` -- and that is
+/// tried first, then the server address, but only while they look like domain
+/// names. If neither does, the transport host is used regardless: an IP there
+/// is at least what the link asked for.
+fn server_name(node: &Node) -> String {
+    if !node.sni.is_empty() {
+        return node.sni.clone();
+    }
+    let transport_host = match node.network.as_str() {
+        "grpc" => &node.authority,
+        _ => &node.host,
+    };
+    // A comma-separated Host list means the first entry.
+    let transport_host = transport_host.split(',').next().unwrap_or("").trim();
+
+    if looks_like_domain(transport_host) {
+        return transport_host.to_string();
+    }
+    if looks_like_domain(&node.server) {
+        return node.server.clone();
+    }
+    // Nothing here is a domain. Other clients leave the field empty and let
+    // Xray substitute the destination address; writing that address out says
+    // the same thing, and says it where someone reading the config can see it.
+    if !transport_host.is_empty() {
+        return transport_host.to_string();
+    }
+    node.server.clone()
+}
+
+/// Whether a string is a hostname rather than an address literal.
+///
+/// Deliberately simple: it only has to separate `cdn.example.com` from
+/// `1.2.3.4` and `2001:db8::1`, which is the whole job here.
+fn looks_like_domain(s: &str) -> bool {
+    if s.is_empty() || s.contains(':') || !s.contains('.') {
+        return false;
+    }
+    // An IPv4 literal is four numeric labels; a domain has at least one that
+    // is not.
+    !s.split('.').all(|label| {
+        !label.is_empty() && label.chars().all(|c| c.is_ascii_digit())
+    })
 }
 
 /// Splits a comma-separated URI value into the array Xray expects.
@@ -1331,6 +1516,157 @@ mod tests {
             let text = build_config(&s).unwrap()["outbounds"][0]["settings"].to_string();
             assert!(text.contains("\"level\":0"), "{uri}: {text}");
         }
+    }
+
+    #[test]
+    fn hysteria2_keeps_its_credential_in_the_transport() {
+        let s = state_with("hysteria2://the-pw@hy.example.com:443?sni=hy.example.com#H");
+        let o = &build_config(&s).unwrap()["outbounds"][0];
+        assert_eq!(o["protocol"], "hysteria", "Xray has no protocol called hysteria2");
+        assert_eq!(o["settings"]["version"], 2);
+        assert!(
+            o["settings"].get("password").is_none(),
+            "the password belongs in hysteriaSettings, not settings"
+        );
+        let st = &o["streamSettings"];
+        assert_eq!(st["hysteriaSettings"]["auth"], "the-pw");
+        assert_eq!(st["security"], "tls", "the dialer fails without it");
+        assert_eq!(st["tlsSettings"]["alpn"][0], "h3");
+    }
+
+    /// Obfuscation and port hopping moved under finalmask; the older
+    /// in-transport spellings are ignored with only a warning, which would
+    /// look like they worked.
+    #[test]
+    fn hysteria2_obfuscation_and_port_hopping_go_under_finalmask() {
+        let s = state_with(
+            "hysteria2://pw@hy.com:443?obfs=salamander&obfs-password=sp&mport=20000-50000#H",
+        );
+        let m = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["finalmask"];
+        assert_eq!(m["udp"][0]["type"], "salamander");
+        assert_eq!(m["udp"][0]["settings"]["password"], "sp");
+        assert_eq!(m["quicParams"]["udpHop"]["ports"], "20000-50000");
+    }
+
+    /// The one that matters on a router. Running as root, Xray would otherwise
+    /// create a real wg interface, zero rp_filter and install its own routes
+    /// on top of the policy routing the transparent proxy depends on.
+    #[test]
+    fn wireguard_is_kept_out_of_the_kernel() {
+        let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        let s = state_with(&format!(
+            "wireguard://{k}@wg.example.com:2408?publickey={k}&address=172.16.0.2%2F32&reserved=1,2,3&mtu=1420#W"
+        ));
+        let o = &build_config(&s).unwrap()["outbounds"][0];
+        assert_eq!(o["protocol"], "wireguard");
+        assert_eq!(o["settings"]["noKernelTun"], true);
+        assert_eq!(o["settings"]["peers"][0]["endpoint"], "wg.example.com:2408");
+        assert_eq!(o["settings"]["reserved"], json!([1, 2, 3]));
+        assert_eq!(o["settings"]["address"][0], "172.16.0.2/32");
+        assert!(
+            o["streamSettings"].get("network").is_none(),
+            "wireguard has no transport"
+        );
+    }
+
+    #[test]
+    fn socks_sends_credentials_only_when_it_has_them() {
+        let anon = state_with("socks://1.2.3.4:1080#S");
+        let o = &build_config(&anon).unwrap()["outbounds"][0];
+        assert_eq!(o["protocol"], "socks");
+        assert!(o["settings"]["servers"][0].get("users").is_none());
+
+        let auth = state_with("socks://alice:s3cret@1.2.3.4:1080#S");
+        let u = &build_config(&auth).unwrap()["outbounds"][0]["settings"]["servers"][0]["users"][0];
+        assert_eq!(u["user"], "alice");
+        assert_eq!(u["pass"], "s3cret");
+    }
+
+    /// An empty serverName is not neutral: Xray substitutes the destination
+    /// address, so an IP-addressed server announces that IP in the handshake
+    /// and REALITY rejects it.
+    #[test]
+    fn server_name_prefers_a_domain_over_an_address() {
+        // sni wins outright
+        let s = state_with("vless://u@1.2.3.4:443?type=ws&security=tls&sni=a.com&host=b.com#n");
+        assert_eq!(sni_of(&s), "a.com");
+        // no sni: the transport host, when it is a domain
+        let s = state_with("vless://u@1.2.3.4:443?type=ws&security=tls&host=b.com#n");
+        assert_eq!(sni_of(&s), "b.com");
+        // host is an address, but the server is a domain
+        let s = state_with("vless://u@real.example.com:443?type=ws&security=tls&host=9.9.9.9#n");
+        assert_eq!(sni_of(&s), "real.example.com");
+        // nothing is a domain: say so rather than leave it blank
+        let s = state_with("vless://u@1.2.3.4:443?type=ws&security=tls#n");
+        assert_eq!(sni_of(&s), "1.2.3.4");
+    }
+
+    /// gRPC carries its host in `authority`, not `host`.
+    #[test]
+    fn grpc_authority_is_emitted_and_used_as_the_sni_fallback() {
+        let s = state_with(
+            "vless://u@1.2.3.4:443?type=grpc&security=tls&authority=g.example.com&serviceName=Gun#n",
+        );
+        let st = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"];
+        assert_eq!(st["grpcSettings"]["authority"], "g.example.com");
+        assert_eq!(st["grpcSettings"]["serviceName"], "Gun");
+        assert_eq!(st["tlsSettings"]["serverName"], "g.example.com");
+    }
+
+    /// `extra` is the only way a link can reach xmux and the padding knobs.
+    /// A malformed one is dropped rather than passed on: Xray refuses the
+    /// whole config over it, and losing one tuning value beats losing the core.
+    #[test]
+    fn xhttp_extra_is_embedded_when_it_is_really_json() {
+        let s = state_with(
+            "vless://u@a.com:443?type=xhttp&extra=%7B%22xmux%22%3A%7B%22maxConcurrency%22%3A%228-16%22%7D%7D#n",
+        );
+        let x = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["xhttpSettings"];
+        assert_eq!(x["extra"]["xmux"]["maxConcurrency"], "8-16");
+
+        let s = state_with("vless://u@a.com:443?type=xhttp&extra=not-json#n");
+        let x = &build_config(&s).unwrap()["outbounds"][0]["streamSettings"]["xhttpSettings"];
+        assert!(x.get("extra").is_none());
+    }
+
+    fn sni_of(s: &crate::model::State) -> String {
+        build_config(s).unwrap()["outbounds"][0]["streamSettings"]["tlsSettings"]["serverName"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    /// Writes one config per protocol so the real Xray binary on the router can
+    /// be asked whether it accepts what this code actually generates -- rather
+    /// than whether it accepts JSON hand-written to look like it.
+    ///
+    /// Ignored by default; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn dump_sample_configs() {
+        let k = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+        for (name, uri) in [
+            ("vless-reality", "vless://u@a.com:443?type=tcp&security=reality&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&sid=ab12&sni=www.apple.com&flow=xtls-rprx-vision#n"),
+            ("vless-tcp-http", "vless://u@a.com:80?type=tcp&headerType=http&host=play.google.com&path=%2F#n"),
+            ("trojan-ws", "trojan://pw@t.com:443?type=ws&security=tls&path=%2Ftj&host=t.com#n"),
+            ("ss-aead", "ss://aes-256-gcm:pw@s.com:8388#n"),
+            ("ss-2022", "ss://2022-blake3-aes-256-gcm:OGNlZmE3YmE2NGJkZWYxYmE2NGJkZWYxYmE2NGJkZWY=@s.com:443#n"),
+            ("vmess-ws", "vmess://u@v.com:443?type=ws&security=tls&host=v.com&path=%2Fws#n"),
+            ("hysteria2", "hysteria2://pw@hy.com:443?sni=hy.com&obfs=salamander&obfs-password=sp&mport=20000-50000#n"),
+            ("socks", "socks://alice:s3cret@1.2.3.4:1080#n"),
+            ("grpc", "vless://u@a.com:443?type=grpc&security=tls&authority=g.com&serviceName=Gun&mode=multi#n"),
+            ("xhttp", "vless://u@a.com:443?type=xhttp&security=tls&host=x.com&mode=stream-one#n"),
+        ] {
+            let cfg = build_config(&state_with(uri)).unwrap();
+            println!("===CONFIG {name}===");
+            println!("{}", serde_json::to_string(&cfg).unwrap());
+        }
+        let wg = format!(
+            "wireguard://{k}@wg.com:2408?publickey={k}&address=172.16.0.2%2F32&reserved=1,2,3&mtu=1420#n"
+        );
+        let cfg = build_config(&state_with(&wg)).unwrap();
+        println!("===CONFIG wireguard===");
+        println!("{}", serde_json::to_string(&cfg).unwrap());
     }
 
     #[test]
