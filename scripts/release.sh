@@ -36,6 +36,11 @@ cp openwrt/etc/config/xrayop                     "$STAGE/etc/config/xrayop"
 cp openwrt/etc/hotplug.d/iface/99-xrayop         "$STAGE/etc/hotplug.d/iface/99-xrayop"
 cp packaging/install.sh packaging/uninstall.sh   "$STAGE/"
 cp README.md                                     "$STAGE/README.md"
+cp LICENSE                                       "$STAGE/LICENSE"
+# The README links to these; without them the copy inside the tarball has dead
+# links for exactly the people least able to go and find the originals.
+mkdir -p "$STAGE/docs"
+cp docs/INSTALL.md docs/screenshot.jpg           "$STAGE/docs/"
 
 # Shell scripts written on Windows carry CRLF, which /bin/sh on the router
 # rejects with a message that blames the wrong line.

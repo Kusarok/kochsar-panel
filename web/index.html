@@ -230,6 +230,24 @@ pre.log{
 }
 .kv{display:flex; gap:12px; padding:6px 0; font-size:13.5px}
 .kv span{color:var(--muted); min-width:135px}
+
+/* ---------- about: contact links ---------- */
+.links{display:flex; flex-direction:column; gap:11px; margin-top:16px}
+.lnk{
+  display:flex; align-items:center; gap:13px; padding:13px 15px;
+  border-radius:14px; color:var(--text); text-decoration:none; background:var(--bg);
+  box-shadow:4px 4px 9px var(--sh-dark), -4px -4px 9px var(--sh-light);
+  transition:box-shadow .18s, transform .12s;
+}
+.lnk:hover{box-shadow:inset 4px 4px 9px var(--sh-dark), inset -4px -4px 9px var(--sh-light)}
+.lnk:active{transform:scale(.99)}
+.lnk>svg{width:21px; height:21px; flex:none; fill:none; stroke:currentColor; stroke-width:1.7; color:var(--accent)}
+.lnk>svg.gh{fill:currentColor; stroke:none}
+.lnk-t{flex:1; min-width:0}
+.lnk-t b{display:block; font-size:13.5px; font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.lnk-t small{display:block; color:var(--muted); font-size:11.5px; margin-top:2px}
+.lnk>svg.go{width:15px; height:15px; color:var(--muted); stroke-width:2.2}
+[dir="rtl"] .lnk>svg.go{transform:scaleX(-1)}
 #toast{
   position:fixed; inset-inline:20px; bottom:86px; margin:0 auto; max-width:420px;
   background:var(--bg); color:var(--text); padding:13px 20px; border-radius:14px;
@@ -514,8 +532,22 @@ pre.log{
 
     <details class="sec">
       <summary data-t="about">About</summary>
-      <div class="sec-body" id="aboutBox">
-        <div class="row" style="margin-top:12px">
+      <div class="sec-body">
+        <!-- Replaced wholesale on every render; anything static must stay outside it. -->
+        <div id="aboutBox"></div>
+        <div class="links">
+          <a class="lnk" href="https://github.com/Kusarok/kochsar-panel" target="_blank" rel="noopener noreferrer">
+            <svg class="gh" viewBox="0 0 24 24"><path d="M12 2A10 10 0 0 0 8.84 21.5c.5.09.68-.22.68-.48l-.01-1.7c-2.78.6-3.37-1.34-3.37-1.34-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.9 1.53 2.36 1.09 2.94.83.09-.65.35-1.09.63-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.98 1.03-2.68-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.02a9.5 9.5 0 0 1 5 0c1.91-1.29 2.75-1.02 2.75-1.02.55 1.38.2 2.4.1 2.65.64.7 1.03 1.59 1.03 2.68 0 3.84-2.34 4.68-4.57 4.93.36.31.68.92.68 1.85l-.01 2.75c0 .27.18.58.69.48A10 10 0 0 0 12 2z"/></svg>
+            <div class="lnk-t"><b dir="ltr">Kusarok/kochsar-panel</b><small data-t="repoHint">Source code, releases and issues</small></div>
+            <svg class="go" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
+          </a>
+          <a class="lnk" href="mailto:info@kafenet.com">
+            <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M3.5 7.6l8.5 6 8.5-6"/></svg>
+            <div class="lnk-t"><b dir="ltr">info@kafenet.com</b><small data-t="mailHint">Feedback and questions</small></div>
+            <svg class="go" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7"/></svg>
+          </a>
+        </div>
+        <div class="row" style="margin-top:14px">
           <button class="btn" id="btnRestore" data-t="restore">Restore server list</button>
           <button class="btn dang" id="btnForget" data-t="forget">Forget token</button>
         </div>
@@ -579,6 +611,7 @@ const I18N = {
     advanced:"Ports and binding", bind:"Reachable from",
     bindLan:"The whole LAN", bindLocal:"This router only", xrayBin:"Xray binary",
     about:"About",
+    repoHint:"Source code, releases and issues", mailHint:"Feedback and questions",
     socksAt:"SOCKS5 proxy", httpAt:"HTTP proxy", state:"State file", version:"Version",
     untested:"—", failed:"down",
     savedNotStarted:"Saved, but it would not start:",
@@ -649,6 +682,7 @@ const I18N = {
     advanced:"پورت‌ها و دسترسی", bind:"قابل دسترس از",
     bindLan:"کل شبکهٔ محلی", bindLocal:"فقط خود روتر", xrayBin:"مسیر باینری Xray",
     about:"درباره",
+    repoHint:"سورس‌کد، نسخه‌ها و گزارش مشکل", mailHint:"بازخورد و پرسش",
     socksAt:"پراکسی SOCKS5", httpAt:"پراکسی HTTP", state:"فایل تنظیمات", version:"نسخه",
     untested:"—", failed:"قطع",
     savedNotStarted:"ذخیره شد ولی اجرا نشد:",
