@@ -506,12 +506,19 @@ fn reapply_rules(app: &Arc<Mutex<App>>) {
         lock(app).tproxy_applied = false;
         return;
     }
-    if let Err(e) = dnsmasq::install(dns_port, &bypass, &resolver) {
-        eprintln!("xrayop: settings changed but the resolver would not re-apply: {e}");
-    }
+    let installed = match dnsmasq::install(dns_port, &bypass, &resolver) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("xrayop: settings changed but the resolver would not re-apply: {e}");
+            false
+        }
+    };
     let mut a = lock(app);
     a.tproxy_applied = true;
     a.dns_via_tunnel = true;
+    if installed {
+        a.dns_domains = bypass;
+    }
 }
 
 /// Folds a settings patch onto `next`, validating as it goes.
@@ -880,7 +887,11 @@ fn handle_tproxy_enable(app: &Arc<Mutex<App>>) -> Body {
         rollback_tproxy(app);
         return error(500, &format!("could not route DNS through the tunnel: {e}"));
     }
-    lock(app).dns_via_tunnel = true;
+    {
+        let mut a = lock(app);
+        a.dns_via_tunnel = true;
+        a.dns_domains = bypass;
+    }
 
     // 4. Arm the rollback. Deliberately *not* saved yet: if the router drops
     //    off the network now, a reboot must come back without any of this.
@@ -942,7 +953,12 @@ fn rollback_tproxy(app: &Arc<Mutex<App>>) {
     if let Err(e) = dnsmasq::remove() {
         eprintln!("xrayop: could not restore dnsmasq: {e}");
     }
-    lock(app).dns_via_tunnel = false;
+    let mut a = lock(app);
+    a.dns_via_tunnel = false;
+    // The drop-in is gone, so nothing is installed. Clearing this makes the
+    // next enable write it rather than compare equal and skip.
+    a.dns_domains.clear();
+    drop(a);
 
     let mut a = lock(app);
     a.tproxy_guard.disarm();
@@ -1070,6 +1086,8 @@ fn finish_write(app: &Arc<Mutex<App>>, mut payload: Value) -> Body {
     let running = a.sup.is_running();
     drop(a);
 
+    sync_dns_domains(app);
+
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("ok".into(), json!(true));
         obj.insert("running".into(), json!(running));
@@ -1078,6 +1096,58 @@ fn finish_write(app: &Arc<Mutex<App>>, mut payload: Value) -> Body {
         }
     }
     json_ok(payload)
+}
+
+/// Rewrites the dnsmasq drop-in when the set of server hostnames has changed.
+///
+/// Every proxy server's hostname needs a rule sending it to a directly
+/// reachable resolver. With `no-resolv` in force, dnsmasq's only upstream is
+/// Xray, and Xray cannot answer a query until it has connected to a server
+/// whose address it cannot resolve. A hostname missing from the drop-in
+/// therefore takes the LAN's DNS down the moment that server is selected and
+/// the cached answer expires.
+///
+/// The drop-in used to be written only when settings changed, the transparent
+/// proxy was enabled, or the daemon started -- never when the node list did.
+/// Adding a subscription introduces hostnames it has never seen, so on a live
+/// router 16 of 29 servers had no rule, including the one in use. It worked
+/// only for as long as the cache held.
+///
+/// Written only when the set actually differs. Installing restarts dnsmasq,
+/// which empties the cache for every device on the network, and this runs after
+/// every write -- including selecting a server, which changes nothing here.
+fn sync_dns_domains(app: &Arc<Mutex<App>>) {
+    let (needed, dns_port, resolver) = {
+        let a = lock(app);
+        // Nothing to keep in step if the LAN is not being resolved through us.
+        if !a.dns_via_tunnel {
+            return;
+        }
+        let needed = a.server_hostnames();
+        if !dns_needs_rewrite(&a.dns_domains, &needed) {
+            return;
+        }
+        (
+            needed,
+            a.state.settings.dns_port,
+            a.state.settings.bypass_resolver(),
+        )
+    };
+    match dnsmasq::install(dns_port, &needed, &resolver) {
+        Ok(()) => lock(app).dns_domains = needed,
+        // Left for the next write to retry. Not fatal: the servers already in
+        // the drop-in keep resolving, so this degrades rather than breaks.
+        Err(e) => eprintln!("xrayop: the server list changed but the DNS drop-in would not update: {e}"),
+    }
+}
+
+/// Whether the drop-in has to be rewritten for `needed`.
+///
+/// Split out so the rule can be tested without a dnsmasq to restart. Both lists
+/// come from [`App::server_hostnames`], which sorts and dedupes, so comparing
+/// them directly is a comparison of sets.
+fn dns_needs_rewrite(installed: &[String], needed: &[String]) -> bool {
+    installed != needed
 }
 
 /// Host of a subscription URL, for display without leaking its token.
@@ -1299,6 +1369,38 @@ mod tests {
         ] {
             assert!(!host_is_literal(bad), "{bad} should be rejected");
         }
+    }
+
+    fn hosts(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The bug this guards: the drop-in was written when settings changed or
+    /// the daemon started, but never when the node list did. Adding a
+    /// subscription brought in hostnames it had never seen, and a hostname with
+    /// no direct-resolution rule cannot be resolved at all -- dnsmasq's only
+    /// upstream is Xray, and Xray needs that name to connect.
+    #[test]
+    fn a_new_subscription_forces_the_dns_dropin_to_be_rewritten() {
+        let installed = hosts(&["a.example.com"]);
+        let needed = hosts(&["a.example.com", "b.example.net"]);
+        assert!(dns_needs_rewrite(&installed, &needed));
+    }
+
+    #[test]
+    fn dropping_a_server_rewrites_it_too() {
+        let installed = hosts(&["a.example.com", "b.example.net"]);
+        assert!(dns_needs_rewrite(&installed, &hosts(&["a.example.com"])));
+    }
+
+    /// This runs after every write, including selecting a server, which changes
+    /// no hostnames. Rewriting restarts dnsmasq and empties the cache for the
+    /// whole LAN, so an unchanged list must be left alone.
+    #[test]
+    fn an_unchanged_server_list_does_not_restart_dnsmasq() {
+        let same = hosts(&["a.example.com", "b.example.net"]);
+        assert!(!dns_needs_rewrite(&same, &same.clone()));
+        assert!(!dns_needs_rewrite(&[], &[]));
     }
 
     #[test]

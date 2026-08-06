@@ -41,6 +41,12 @@ pub struct App {
     pub tproxy_applied: bool,
     /// Whether dnsmasq is currently forwarding the LAN's queries to Xray.
     pub dns_via_tunnel: bool,
+    /// The server hostnames currently written into the dnsmasq drop-in.
+    ///
+    /// Held so the drop-in can be rewritten exactly when the set changes and
+    /// not otherwise: installing it restarts dnsmasq, which empties the DNS
+    /// cache for every device on the network.
+    pub dns_domains: Vec<String>,
     /// Liveness counters kept by [`crate::health`].
     pub health: crate::health::Status,
     /// Automatic-failover counters kept by [`crate::switcher`].
@@ -93,6 +99,7 @@ impl App {
             tproxy_deadline: 0,
             tproxy_applied: false,
             dns_via_tunnel: false,
+            dns_domains: Vec::new(),
             health: crate::health::Status::default(),
             switcher: crate::switcher::Status::default(),
             probing: Arc::new(AtomicBool::new(false)),

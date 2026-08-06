@@ -173,6 +173,8 @@ fn handle_dead_core(app: &Arc<Mutex<App>>, transparent: bool) {
         let mut a = lock(app);
         a.tproxy_applied = false;
         a.dns_via_tunnel = false;
+        // Removed, so nothing is installed; the restore path must rewrite it.
+        a.dns_domains.clear();
         a.health.degraded = true;
     }
 }
@@ -205,6 +207,7 @@ fn restore_rules(app: &Arc<Mutex<App>>) {
     let mut a = lock(app);
     a.tproxy_applied = true;
     a.dns_via_tunnel = true;
+    a.dns_domains = bypass;
     a.health.degraded = false;
     a.health.last_failure.clear();
     eprintln!("xrayop: xray recovered; transparent proxy restored");

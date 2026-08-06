@@ -166,7 +166,10 @@ fn main() -> ExitCode {
         let bypass = app.server_hostnames();
         let resolver = app.state.settings.bypass_resolver();
         match dnsmasq::install(app.state.settings.dns_port, &bypass, &resolver) {
-            Ok(()) => app.dns_via_tunnel = true,
+            Ok(()) => {
+                app.dns_via_tunnel = true;
+                app.dns_domains = bypass;
+            }
             Err(e) => eprintln!("xrayopd: could not restore tunnelled DNS: {e}"),
         }
     } else if tproxy::is_applied() {
