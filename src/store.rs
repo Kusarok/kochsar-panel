@@ -54,6 +54,12 @@ pub struct App {
     /// Set while a latency sweep is running, so a user hammering "test all"
     /// cannot pin every worker thread at once.
     pub probing: Arc<AtomicBool>,
+    /// Set by `/api/service stop`: the user asked for the core to stay down,
+    /// so [`crate::health`] must not resurrect it and [`crate::switcher`] must
+    /// not switch -- switching restarts it. Cleared by any explicit start,
+    /// selection or mode change. In-memory only: mode "off" is the persisted
+    /// way to stop.
+    pub core_paused: bool,
     state_path: PathBuf,
 }
 
@@ -144,6 +150,7 @@ impl App {
             health: crate::health::Status::default(),
             switcher: crate::switcher::Status::default(),
             probing: Arc::new(AtomicBool::new(false)),
+            core_paused: false,
             state_path,
         };
         (app, warning)
@@ -227,8 +234,14 @@ impl App {
     ///
     /// Saving first means a failure to start still leaves the user's choice on
     /// disk, so the panel reflects what they picked and shows why it failed.
+    ///
+    /// A paused core is only saved, not started: the paths that legitimately
+    /// run it again -- start, select, mode change -- lift the pause first.
     pub fn save_and_apply(&mut self) -> Result<(), String> {
         self.save()?;
+        if self.core_paused {
+            return Ok(());
+        }
         let state = self.state.clone();
         self.sup.apply(&state)
     }
@@ -368,11 +381,17 @@ impl App {
         true
     }
 
+    /// Selects a server. Also lifts any pause and clears the failure counter:
+    /// choosing a server -- by hand or by failover -- is a fresh start for it.
+    /// A stale count used to let a pending failover fire *after* a manual pick
+    /// and mark the server the user had just chosen as failed.
     pub fn select(&mut self, id: &str) -> Result<(), String> {
         if self.state.find(id).is_none() {
             return Err("no such node".into());
         }
         self.state.active = id.to_string();
+        self.health.probe_failures = 0;
+        self.core_paused = false;
         Ok(())
     }
 
@@ -574,6 +593,22 @@ mod tests {
     #[test]
     fn selecting_an_unknown_node_fails() {
         assert!(app().select("nope").is_err());
+    }
+
+    /// A selection is a fresh start: the failure counter the switcher triggers
+    /// on, and any pause the user asked for, both reset. Without the first, a
+    /// failover already counting down fired against the server the user had
+    /// just picked by hand.
+    #[test]
+    fn selecting_a_server_clears_failures_and_a_pause() {
+        let mut app = app();
+        app.add_nodes_from_text(&format!("{A}\n{B}"));
+        let id = app.state.nodes[0].id.clone();
+        app.health.probe_failures = 3;
+        app.core_paused = true;
+        app.select(&id).unwrap();
+        assert_eq!(app.health.probe_failures, 0);
+        assert!(!app.core_paused);
     }
 
     #[test]

@@ -20,7 +20,9 @@
 //! avoid is procd's default, which abandons a crash-looping service while its
 //! firewall rules stay loaded.
 //!
-//! When the core comes back, the rules are re-applied automatically.
+//! When the core comes back, the rules are re-applied automatically. A tunnel
+//! unwind is different: the core never died, so liveness proves nothing, and
+//! the rules go back only once a deep check passes again.
 //!
 //! ## Why a hung core is treated differently
 //!
@@ -103,6 +105,12 @@ pub struct Status {
     pub probe_failures: u32,
     /// Whether the last deep check succeeded.
     pub reachable: bool,
+    /// True when the rules were torn down specifically because the tunnel
+    /// carried no traffic ([`unwind_dead_tunnel`]), as opposed to a core that
+    /// would not start. The restores differ: a dead core may be put back the
+    /// moment it runs again, a dead tunnel only once a probe passes -- the
+    /// core being alive is not evidence the tunnel carries traffic.
+    pub tunnel_unwound: bool,
 }
 
 /// State the health thread carries between ticks.
@@ -129,11 +137,14 @@ pub fn spawn(app: Arc<Mutex<App>>) {
 }
 
 fn tick(app: &Arc<Mutex<App>>, watch: &mut Watch) {
-    // Nothing selected means nothing is supposed to be running.
+    // Nothing selected, switched off, or deliberately paused means nothing is
+    // supposed to be running. Without the second and third conditions this
+    // thread "restarted" an intentionally stopped core every five seconds --
+    // it cannot tell "stopped on purpose" from "died" on its own.
     let (should_run, transparent, socks_port, test_url, resolver) = {
         let a = lock(app);
         (
-            !a.state.active.is_empty(),
+            !a.state.active.is_empty() && a.state.settings.core_enabled() && !a.core_paused,
             a.state.settings.transparent,
             a.state.settings.socks_port,
             crate::dnscfg::test_url(&a.state.settings),
@@ -151,14 +162,19 @@ fn tick(app: &Arc<Mutex<App>>, watch: &mut Watch) {
         return;
     }
 
-    // Alive. Clear the restart counter and, if we previously gave up, put the
-    // rules back now that there is something behind them again.
-    let was_degraded = {
+    // Alive. Clear the restart counter and, if we previously gave up because
+    // the core would not start, put the rules back now that there is something
+    // behind them again. A tunnel unwind is NOT restored here: the core never
+    // died in that case, so its being alive says nothing about whether traffic
+    // passes. Restoring on liveness anyway was the flap -- the rules went back
+    // onto a still-dead tunnel within one tick, the next failed probe took
+    // them down again, and dnsmasq restarted twice a cycle forever.
+    let (was_degraded, tunnel_unwound) = {
         let mut a = lock(app);
         a.health.failures = 0;
-        a.health.degraded
+        (a.health.degraded, a.health.tunnel_unwound)
     };
-    if was_degraded && transparent {
+    if was_degraded && transparent && restore_on_liveness(tunnel_unwound) {
         restore_rules(app);
     }
 
@@ -175,6 +191,11 @@ fn tick(app: &Arc<Mutex<App>>, watch: &mut Watch) {
     if ok {
         if watch.bad_since.take().is_some() {
             eprintln!("xrayop: the tunnel is carrying traffic again");
+        }
+        // The one piece of evidence a dead-tunnel unwind may be undone on:
+        // traffic actually passes again.
+        if transparent && lock(app).health.tunnel_unwound {
+            restore_rules(app);
         }
         return;
     }
@@ -228,6 +249,7 @@ fn unwind_dead_tunnel(app: &Arc<Mutex<App>>, resolver: &str) {
     a.dns_via_tunnel = false;
     a.dns_domains.clear();
     a.health.degraded = true;
+    a.health.tunnel_unwound = true;
     a.health.last_failure = "the tunnel carried no traffic for ten minutes".into();
 }
 
@@ -277,8 +299,20 @@ fn handle_dead_core(app: &Arc<Mutex<App>>, transparent: bool) {
     }
 }
 
-/// Put the rules back after the core recovered.
-fn restore_rules(app: &Arc<Mutex<App>>) {
+/// Whether the rules may go back up purely because the core is alive again.
+///
+/// True only for a core that would not start: the process running *is* the
+/// recovery. A tunnel unwind is different -- the core never died, so its
+/// being alive says nothing about whether traffic passes, and restoring on
+/// that evidence alone put the rules back onto a still-dead tunnel one tick
+/// after they came down.
+fn restore_on_liveness(tunnel_unwound: bool) -> bool {
+    !tunnel_unwound
+}
+
+/// Put the rules back after the core recovered. Also how `/api/service start`
+/// re-applies them after a stop in transparent mode took them down.
+pub(crate) fn restore_rules(app: &Arc<Mutex<App>>) {
     let host = lock(app).active_server_host();
     let ips = host.map(|h| probe::resolve_all(&h)).unwrap_or_default();
 
@@ -307,8 +341,9 @@ fn restore_rules(app: &Arc<Mutex<App>>) {
     a.dns_via_tunnel = true;
     a.dns_domains = bypass;
     a.health.degraded = false;
+    a.health.tunnel_unwound = false;
     a.health.last_failure.clear();
-    eprintln!("xrayop: xray recovered; transparent proxy restored");
+    eprintln!("xrayop: transparent proxy restored");
 }
 
 /// Does a request actually complete through the proxy? Returns whether it did.
@@ -347,7 +382,10 @@ fn run_deep_check(
 
     eprintln!("xrayop: xray is running but {failures} checks failed; restarting it");
     let mut a = lock(app);
-    a.health.probe_failures = 0;
+    // The counter is deliberately not reset: it is the switcher's failover
+    // signal, and only a successful probe may clear it. Zeroing it here
+    // postponed a pending failover by two probe cycles for nothing -- the
+    // restart does not make the upstream server work.
     let state = a.state.clone();
     if let Err(e) = a.sup.apply(&state) {
         a.health.last_failure = e;
@@ -488,6 +526,20 @@ mod tests {
         assert_eq!(s.restarts, 0);
         assert_eq!(s.failures, 0);
         assert!(!s.degraded);
+        assert!(!s.tunnel_unwound);
         assert!(s.last_failure.is_empty());
+    }
+
+    /// The flap this module once had: a dead-tunnel unwind was undone one tick
+    /// later because the core happened to be alive, then the next failed probe
+    /// unwound again -- the rules and dnsmasq churned every twenty seconds
+    /// forever, and the LAN never got its direct fallback.
+    #[test]
+    fn a_dead_tunnel_unwind_is_not_undone_by_liveness_alone() {
+        assert!(restore_on_liveness(false), "a dead core running again is recovery");
+        assert!(
+            !restore_on_liveness(true),
+            "a live core says nothing about whether the tunnel passes traffic"
+        );
     }
 }
