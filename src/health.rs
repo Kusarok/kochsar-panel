@@ -42,22 +42,49 @@ use std::time::{Duration, Instant};
 
 /// How often liveness is checked. Short enough that a crash is invisible to
 /// anyone watching a video, long enough to be free.
-const CHECK_INTERVAL: Duration = Duration::from_secs(15);
+///
+/// This also paces the deep check below, which is gated on it -- so it has to
+/// divide [`PROBE_EVERY`] cleanly or the real probe cadence rounds up to the
+/// next tick.
+const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Consecutive failed restarts before the transparent-proxy rules are torn
-/// down. Four attempts across a minute is enough to distinguish "a transient
+/// down. About a minute of trying is enough to distinguish "a transient
 /// problem" from "this configuration cannot run".
-const UNWIND_AFTER: u32 = 4;
+const UNWIND_AFTER: u32 = 12;
 
 /// How often the deep check runs while the core is alive.
-const PROBE_EVERY: Duration = Duration::from_secs(60);
+///
+/// This is the dominant term in how long the LAN stays offline after a server
+/// dies: failover needs two consecutive failures, so this interval is most of
+/// the detection time.
+const PROBE_EVERY: Duration = Duration::from_secs(20);
 /// Consecutive deep-check failures before restarting a core that is alive but
-/// not forwarding.
-const PROBE_FAILURES_BEFORE_RESTART: u32 = 5;
+/// not forwarding. Counts probes, not seconds -- keep it in step with
+/// [`PROBE_EVERY`] so the wall-clock threshold stays around five minutes.
+const PROBE_FAILURES_BEFORE_RESTART: u32 = 15;
 /// Minimum gap between two probe-triggered restarts.
 const PROBE_RESTART_COOLDOWN: Duration = Duration::from_secs(600);
 /// Budget for one deep check. Generous: a slow tunnel is not a broken one.
 const PROBE_TIMEOUT_SECS: u32 = 12;
+
+/// How long the tunnel may carry nothing before the rules come down.
+///
+/// This is the last resort, reached only after failover has had several
+/// chances and the raw WAN is known to be working. A direct connection is not
+/// what anyone wants, but a house with no internet at all is worse.
+const TUNNEL_UNWIND_AFTER: Duration = Duration::from_secs(600);
+
+/// Budget for the direct check that decides whether the WAN itself is up.
+const WAN_CHECK_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How often the tunnel is checked, so the switcher's tests can reason about
+/// their own detection budget without copying the constant and letting the two
+/// drift apart.
+#[cfg(test)]
+pub fn probe_interval() -> Duration {
+    PROBE_EVERY
+}
 
 /// Health counters, surfaced by the panel.
 #[derive(Debug, Default, Clone)]
@@ -78,31 +105,39 @@ pub struct Status {
     pub reachable: bool,
 }
 
+/// State the health thread carries between ticks.
+#[derive(Default)]
+struct Watch {
+    last_probe: Option<Instant>,
+    last_probe_restart: Option<Instant>,
+    /// When the tunnel first stopped carrying traffic, cleared on success.
+    ///
+    /// Kept here rather than derived from `probe_failures`, which the restart
+    /// path zeroes: the question "how long has the LAN been offline" has to
+    /// survive our own attempts to fix it.
+    bad_since: Option<Instant>,
+}
+
 pub fn spawn(app: Arc<Mutex<App>>) {
     thread::spawn(move || {
-        let mut last_probe = Instant::now();
-        let mut last_probe_restart: Option<Instant> = None;
-
+        let mut watch = Watch::default();
         loop {
             thread::sleep(CHECK_INTERVAL);
-            tick(&app, &mut last_probe, &mut last_probe_restart);
+            tick(&app, &mut watch);
         }
     });
 }
 
-fn tick(
-    app: &Arc<Mutex<App>>,
-    last_probe: &mut Instant,
-    last_probe_restart: &mut Option<Instant>,
-) {
+fn tick(app: &Arc<Mutex<App>>, watch: &mut Watch) {
     // Nothing selected means nothing is supposed to be running.
-    let (should_run, transparent, socks_port, test_url) = {
+    let (should_run, transparent, socks_port, test_url, resolver) = {
         let a = lock(app);
         (
             !a.state.active.is_empty(),
             a.state.settings.transparent,
             a.state.settings.socks_port,
             crate::dnscfg::test_url(&a.state.settings),
+            a.state.settings.bypass_resolver(),
         )
     };
     if !should_run {
@@ -127,10 +162,73 @@ fn tick(
         restore_rules(app);
     }
 
-    if last_probe.elapsed() >= PROBE_EVERY {
-        *last_probe = Instant::now();
-        run_deep_check(app, socks_port, &test_url, last_probe_restart);
+    let due = watch
+        .last_probe
+        .map(|t| t.elapsed() >= PROBE_EVERY)
+        .unwrap_or(true);
+    if !due {
+        return;
     }
+    watch.last_probe = Some(Instant::now());
+
+    let ok = run_deep_check(app, socks_port, &test_url, &mut watch.last_probe_restart);
+    if ok {
+        if watch.bad_since.take().is_some() {
+            eprintln!("xrayop: the tunnel is carrying traffic again");
+        }
+        return;
+    }
+
+    let down_for = *watch.bad_since.get_or_insert_with(Instant::now);
+    // Only interesting once it has lasted; a single failed probe is noise.
+    let failures = lock(app).health.probe_failures;
+    if failures == 2 {
+        eprintln!(
+            "xrayop: the tunnel has failed {failures} checks -- the active server \
+             is not carrying traffic"
+        );
+    }
+
+    if transparent && down_for.elapsed() >= TUNNEL_UNWIND_AFTER {
+        unwind_dead_tunnel(app, &resolver);
+    }
+}
+
+/// Last resort: the core is running, the rules are loaded, and nothing gets
+/// through any of it.
+///
+/// `handle_dead_core` already does this for a core that will not start, but
+/// that path cannot be reached while the process is alive -- and a live core
+/// in front of a dead server strands the LAN exactly as thoroughly. Failover
+/// has had ten minutes and several attempts by the time this runs.
+///
+/// Not done when the user's own internet is down: there would be nothing to
+/// fall back *to*, and the rules would have to be rebuilt for nothing.
+fn unwind_dead_tunnel(app: &Arc<Mutex<App>>, resolver: &str) {
+    if lock(app).health.degraded {
+        return;
+    }
+    if !wan_reachable(resolver) {
+        eprintln!(
+            "xrayop: the tunnel is down, but so is the WAN -- leaving the rules in place"
+        );
+        return;
+    }
+
+    eprintln!(
+        "xrayop: nothing has passed through the tunnel for ten minutes and the WAN is up; \
+         removing the transparent-proxy rules so the LAN keeps working"
+    );
+    let plan = lock(app).tproxy_plan(Vec::new());
+    tproxy::revert(&plan);
+    let _ = dnsmasq::remove();
+
+    let mut a = lock(app);
+    a.tproxy_applied = false;
+    a.dns_via_tunnel = false;
+    a.dns_domains.clear();
+    a.health.degraded = true;
+    a.health.last_failure = "the tunnel carried no traffic for ten minutes".into();
 }
 
 /// Restart the core; tear the rules down if it will not stay up.
@@ -213,13 +311,13 @@ fn restore_rules(app: &Arc<Mutex<App>>) {
     eprintln!("xrayop: xray recovered; transparent proxy restored");
 }
 
-/// Does a request actually complete through the proxy?
+/// Does a request actually complete through the proxy? Returns whether it did.
 fn run_deep_check(
     app: &Arc<Mutex<App>>,
     socks_port: u16,
     url: &str,
     last_restart: &mut Option<Instant>,
-) {
+) -> bool {
     let ok = request_succeeds(socks_port, url);
 
     let failures = {
@@ -233,7 +331,7 @@ fn run_deep_check(
         a.health.probe_failures
     };
     if ok || failures < PROBE_FAILURES_BEFORE_RESTART {
-        return;
+        return ok;
     }
 
     // The core is alive but nothing gets through. This is also what a dead
@@ -242,7 +340,7 @@ fn run_deep_check(
     // minutes instead of one every minute.
     if let Some(when) = last_restart {
         if when.elapsed() < PROBE_RESTART_COOLDOWN {
-            return;
+            return ok;
         }
     }
     *last_restart = Some(Instant::now());
@@ -256,6 +354,32 @@ fn run_deep_check(
     } else {
         a.health.restarts += 1;
     }
+    ok
+}
+
+/// Whether the raw WAN carries traffic at all, measured without the tunnel.
+///
+/// Every symptom this module reacts to -- the probe timing out, the LAN going
+/// quiet -- looks identical whether the proxy server died or the user's own
+/// internet did. Switching servers cannot fix the second, and trying makes it
+/// worse: it cycles through the whole list, restarting the core each time,
+/// while the one thing that would help is waiting.
+///
+/// A TCP connection to the bypass resolver on port 53 answers the question
+/// cheaply and, importantly, *directly*. That address is already exempt from
+/// interception twice over -- it sits in the `bypass4` set, and the output
+/// chain returns early on port 53 -- so this cannot accidentally be measured
+/// through the tunnel it is supposed to be independent of.
+///
+/// An unparseable resolver returns `true`: this check exists to *suppress*
+/// failover, and one that cannot run must not be the reason a dead server is
+/// kept.
+pub fn wan_reachable(resolver: &str) -> bool {
+    let Ok(ip) = resolver.trim().parse::<std::net::IpAddr>() else {
+        return true;
+    };
+    let addr = std::net::SocketAddr::new(ip, 53);
+    std::net::TcpStream::connect_timeout(&addr, WAN_CHECK_TIMEOUT).is_ok()
 }
 
 fn request_succeeds(socks_port: u16, url: &str) -> bool {
@@ -318,6 +442,44 @@ mod tests {
     fn liveness_is_cheaper_than_reachability() {
         assert!(CHECK_INTERVAL < PROBE_EVERY);
         assert!(PROBE_TIMEOUT_SECS as u64 <= PROBE_EVERY.as_secs());
+    }
+
+    /// The deep check is gated on the liveness tick, so a probe interval that
+    /// is not a multiple of it silently rounds up -- 20 s asked for, 30 s
+    /// delivered, and the detection budget blown by half.
+    #[test]
+    fn the_probe_cadence_is_not_quietly_rounded_up() {
+        assert_eq!(
+            PROBE_EVERY.as_secs() % CHECK_INTERVAL.as_secs(),
+            0,
+            "PROBE_EVERY must be a whole number of ticks"
+        );
+    }
+
+    /// The restart threshold counts probes, not seconds. Changing the probe
+    /// rate without it would move the real threshold with it.
+    #[test]
+    fn the_restart_threshold_is_still_about_five_minutes() {
+        let wall_clock = PROBE_EVERY * PROBE_FAILURES_BEFORE_RESTART;
+        assert!(wall_clock >= Duration::from_secs(240));
+        assert!(wall_clock <= Duration::from_secs(420));
+    }
+
+    /// The last resort has to come after failover has had a real chance,
+    /// or the LAN drops to a direct connection over something that would have
+    /// been fixed by changing servers.
+    #[test]
+    fn the_tunnel_unwind_waits_longer_than_failover_needs() {
+        assert!(TUNNEL_UNWIND_AFTER >= Duration::from_secs(300));
+        assert!(TUNNEL_UNWIND_AFTER > PROBE_EVERY * PROBE_FAILURES_BEFORE_RESTART);
+    }
+
+    /// It cannot answer, so it must not be the reason failover is suppressed.
+    #[test]
+    fn an_unparseable_resolver_reports_the_wan_as_up() {
+        assert!(wan_reachable(""));
+        assert!(wan_reachable("router.lan"));
+        assert!(wan_reachable("  "));
     }
 
     #[test]

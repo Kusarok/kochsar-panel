@@ -395,6 +395,32 @@ impl App {
             .min_by_key(|n| n.latency)
     }
 
+    /// The fastest server that is *not* `exclude`.
+    ///
+    /// For failover, where the excluded one is the server the LAN cannot
+    /// currently reach through. It may still hold the best stored latency --
+    /// that is exactly the case that made failover fail before, since a
+    /// throttled server measures fine from a fresh probe.
+    pub fn fastest_other(&self, exclude: &str) -> Option<&Node> {
+        self.state
+            .nodes
+            .iter()
+            .filter(|n| n.latency >= 0 && n.id != exclude)
+            .min_by_key(|n| n.latency)
+    }
+
+    /// Records that a server did not work, so it is not immediately re-elected.
+    ///
+    /// Used when leaving a server the live tunnel could not carry traffic
+    /// through. Its stored latency came from a separate probe instance and says
+    /// nothing about that; without this the very next sweep would pick it again
+    /// on the strength of a number we have just watched be wrong.
+    pub fn mark_failed(&mut self, id: &str) {
+        if let Some(n) = self.state.nodes.iter_mut().find(|n| n.id == id) {
+            n.latency = Node::LATENCY_FAILED;
+        }
+    }
+
     fn clear_active_if_gone(&mut self) {
         if !self.state.active.is_empty() && self.state.find(&self.state.active).is_none() {
             self.state.active.clear();
@@ -560,6 +586,55 @@ mod tests {
             (ids[1].clone(), 120),
             // ids[2] stays untested
         ]);
+        assert_eq!(app.fastest().unwrap().id, ids[1]);
+    }
+
+    /// Failover's whole difficulty: the server it is escaping usually still
+    /// holds the best stored number, because that number came from a separate
+    /// probe instance that had no trouble reaching it.
+    #[test]
+    fn fastest_other_skips_the_server_being_escaped() {
+        let mut app = app();
+        app.add_nodes_from_text(&format!("{A}\n{B}\n{C}"));
+        let ids: Vec<_> = app.state.nodes.iter().map(|n| n.id.clone()).collect();
+        app.apply_latencies(vec![
+            (ids[0].clone(), 90), // the failing one, and the fastest on paper
+            (ids[1].clone(), 120),
+            (ids[2].clone(), Node::LATENCY_FAILED),
+        ]);
+        assert_eq!(app.fastest().unwrap().id, ids[0], "still the fastest");
+        assert_eq!(
+            app.fastest_other(&ids[0]).unwrap().id,
+            ids[1],
+            "but not what failover should pick"
+        );
+    }
+
+    #[test]
+    fn fastest_other_gives_up_rather_than_returning_a_dead_server() {
+        let mut app = app();
+        app.add_nodes_from_text(&format!("{A}\n{B}"));
+        let ids: Vec<_> = app.state.nodes.iter().map(|n| n.id.clone()).collect();
+        app.apply_latencies(vec![
+            (ids[0].clone(), 90),
+            (ids[1].clone(), Node::LATENCY_FAILED),
+        ]);
+        assert!(app.fastest_other(&ids[0]).is_none());
+    }
+
+    /// Without this the next sweep re-elects the server we just watched fail,
+    /// on the strength of a measurement we have proof is not representative.
+    #[test]
+    fn marking_a_server_failed_takes_it_out_of_contention() {
+        let mut app = app();
+        app.add_nodes_from_text(&format!("{A}\n{B}"));
+        let ids: Vec<_> = app.state.nodes.iter().map(|n| n.id.clone()).collect();
+        app.apply_latencies(vec![(ids[0].clone(), 90), (ids[1].clone(), 120)]);
+
+        app.mark_failed(&ids[0]);
+        assert_eq!(app.fastest().unwrap().id, ids[1]);
+        // An unknown id is a no-op, not a panic.
+        app.mark_failed("no-such-node");
         assert_eq!(app.fastest().unwrap().id, ids[1]);
     }
 

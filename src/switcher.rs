@@ -37,19 +37,38 @@ use std::time::{Duration, Instant};
 
 /// How often the conditions are re-examined. Much shorter than any sweep
 /// interval, so a failure trigger is acted on promptly.
-const TICK: Duration = Duration::from_secs(30);
+const TICK: Duration = Duration::from_secs(10);
 
 /// Consecutive health-probe failures before failover is triggered.
 ///
-/// The probe runs once a minute, so this is about three minutes of the tunnel
-/// not carrying traffic -- long enough not to react to one bad minute.
-const FAILURES_BEFORE_FAILOVER: u32 = 3;
+/// The probe runs every twenty seconds, so this is about forty seconds of the
+/// tunnel not carrying traffic -- long enough that a single blip does not
+/// reconnect the whole house, short enough that nobody finishes making tea.
+const FAILURES_BEFORE_FAILOVER: u32 = 2;
 
-/// Shortest gap between two automatic switches, whatever the trigger.
+/// Shortest gap between two *quality* switches.
 ///
 /// Every switch restarts the core and drops live connections. Without a floor,
 /// a subscription where several servers are borderline would flap between them.
 const MIN_GAP: Duration = Duration::from_secs(300);
+
+/// Shortest gap between two attempts to escape a tunnel that is carrying
+/// nothing.
+///
+/// Deliberately far below [`MIN_GAP`]. That floor exists to stop flapping
+/// between servers that both work; applying it here would strand the LAN for
+/// five minutes whenever the server we just moved to is also down. Long enough
+/// for the health probe to reach a verdict on the new server -- two checks --
+/// and no longer.
+const ESCAPE_GAP: Duration = Duration::from_secs(60);
+
+/// How often latencies are refreshed in the background.
+///
+/// Separate from `auto_switch_minutes`, which is how often the user asked the
+/// panel to *change servers*. Measuring is not switching, and the stored table
+/// is what a failover picks a replacement from -- four-hour-old numbers are not
+/// something to bet the household's internet on.
+const REFRESH_EVERY: Duration = Duration::from_secs(30 * 60);
 
 /// A replacement must beat the current server by at least this fraction...
 const BETTER_BY: f64 = 0.80;
@@ -86,33 +105,90 @@ pub struct Status {
     pub last_sweep: u64,
 }
 
+/// Why the switcher woke up.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Reason {
+    /// The tunnel is not carrying traffic. Get off this server.
+    Failover,
+    /// The user's interval elapsed; a clearly better server may be adopted.
+    Scheduled,
+    /// Keep the measurements current. Never switches a working server.
+    Refresh,
+}
+
+impl Reason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Reason::Failover => "failover",
+            Reason::Scheduled => "scheduled",
+            Reason::Refresh => "refresh",
+        }
+    }
+}
+
+/// Clocks the switcher keeps between ticks.
+///
+/// The schedule and the refresh are deliberately separate. Sharing one meant a
+/// burst of failovers pushed the user's next scheduled sweep out by another
+/// four hours each time.
+struct Clocks {
+    scheduled: Instant,
+    refresh: Instant,
+    /// Last *quality* switch, for [`MIN_GAP`].
+    switch: Option<Instant>,
+    /// Last attempt to escape a dead tunnel, for [`ESCAPE_GAP`]. Recorded even
+    /// when the attempt changed nothing, or a failed attempt would repeat on
+    /// every tick and sweep the whole list every ten seconds.
+    escape: Option<Instant>,
+}
+
 pub fn spawn(app: Arc<Mutex<App>>) {
     thread::spawn(move || {
         // Not zero: a sweep the instant the daemon starts would run before the
         // core has finished coming up and report everything as failed.
-        let mut last_sweep = Instant::now();
-        let mut last_switch = None::<Instant>;
+        let now = Instant::now();
+        let mut clocks = Clocks {
+            scheduled: now,
+            refresh: now,
+            switch: None,
+            escape: None,
+        };
 
         loop {
             thread::sleep(TICK);
-            if let Some(reason) = due(&app, last_sweep, last_switch) {
-                if run_sweep(&app, reason, &mut last_switch) {
-                    // Only a completed sweep resets the schedule; one that was
-                    // skipped because a manual test held the gate should be
-                    // retried on the next tick.
-                    last_sweep = Instant::now();
+            let Some(reason) = due(&app, &clocks) else {
+                continue;
+            };
+            match reason {
+                Reason::Failover => {
+                    clocks.escape = Some(Instant::now());
+                    if escape_dead_tunnel(&app, &mut clocks) {
+                        // Refresh afterwards so the next failure has current
+                        // numbers to choose from, and so the server we just
+                        // left is measured again rather than left guessed at.
+                        if run_sweep(&app, Reason::Refresh, &mut clocks) {
+                            clocks.refresh = Instant::now();
+                        }
+                    }
+                }
+                Reason::Scheduled => {
+                    if run_sweep(&app, reason, &mut clocks) {
+                        clocks.scheduled = Instant::now();
+                        clocks.refresh = Instant::now();
+                    }
+                }
+                Reason::Refresh => {
+                    if run_sweep(&app, reason, &mut clocks) {
+                        clocks.refresh = Instant::now();
+                    }
                 }
             }
         }
     });
 }
 
-/// Why a sweep should run now, or `None`.
-fn due(
-    app: &Arc<Mutex<App>>,
-    last_sweep: Instant,
-    last_switch: Option<Instant>,
-) -> Option<&'static str> {
+/// What should happen now, or nothing.
+fn due(app: &Arc<Mutex<App>>, clocks: &Clocks) -> Option<Reason> {
     let a = lock(app);
     if !a.state.settings.auto_switch || a.state.nodes.len() < 2 {
         return None;
@@ -124,24 +200,108 @@ fn due(
 
     let failing = a.health.probe_failures >= FAILURES_BEFORE_FAILOVER;
     let interval = Duration::from_secs(a.state.settings.auto_switch_minutes.max(1) as u64 * 60);
-    let scheduled = last_sweep.elapsed() >= interval;
     drop(a);
 
     if failing {
-        // The floor still applies: if switching did not help, switching again
-        // immediately will not either.
-        if last_switch.map(|t| t.elapsed() < MIN_GAP).unwrap_or(false) {
-            return None;
+        let blocked = clocks
+            .escape
+            .map(|t| t.elapsed() < ESCAPE_GAP)
+            .unwrap_or(false);
+        if !blocked {
+            return Some(Reason::Failover);
         }
-        return Some("failover");
+        // Fall through rather than returning. A blocked escape used to suppress
+        // the scheduled sweep as well, so a spell of failures could postpone
+        // the user's interval indefinitely.
     }
-    scheduled.then_some("scheduled")
+    if clocks.scheduled.elapsed() >= interval {
+        return Some(Reason::Scheduled);
+    }
+    if clocks.refresh.elapsed() >= REFRESH_EVERY {
+        return Some(Reason::Refresh);
+    }
+    None
 }
 
-/// Measures every server and switches if there is a clear winner.
+/// The tunnel is not carrying traffic. Move to another server now.
+///
+/// This deliberately does **not** consult [`is_worth_switching`], and that is
+/// the whole point of it being separate. That rule judges gradual decay, and it
+/// asks "is the alternative clearly better?" -- a reasonable question when the
+/// current server works, and the wrong one when the LAN has no internet.
+///
+/// The two measurements disagree here by design. The health probe goes through
+/// the *live core*; the latency sweep measures through a *fresh throwaway
+/// Xray*, so that a failing active server cannot drag the others down. When a
+/// server is throttled, out of quota, or the running core is wedged, the live
+/// probe fails while the fresh probe still reports a good number -- and the
+/// decay rule then answers "not 20% better, stay". Forever, while nothing
+/// works. Asking instead "which other server is known to work" is the fix.
+///
+/// No sweep first: measuring 31 servers takes twenty seconds the household
+/// spends offline. The stored table is refreshed afterwards.
+fn escape_dead_tunnel(app: &Arc<Mutex<App>>, clocks: &mut Clocks) -> bool {
+    let (resolver, active_id) = {
+        let a = lock(app);
+        (a.state.settings.bypass_resolver(), a.state.active.clone())
+    };
+
+    // Every symptom of a dead server is also a symptom of a dead WAN, and
+    // switching cannot fix the second -- it just cycles the whole list,
+    // restarting the core each time, while waiting is what would help.
+    if !crate::health::wan_reachable(&resolver) {
+        eprintln!(
+            "xrayop: the tunnel is down, but so is the WAN -- staying on the current server"
+        );
+        return false;
+    }
+
+    let pick = {
+        let a = lock(app);
+        a.fastest_other(&active_id)
+            .map(|n| (n.id.clone(), n.name.clone(), n.latency))
+    };
+    let Some((id, name, latency)) = pick else {
+        eprintln!(
+            "xrayop: the tunnel is down and no other server has a working measurement; \
+             leaving it alone"
+        );
+        return false;
+    };
+
+    let mut a = lock(app);
+    // The server we are leaving measured fine from a fresh instance and failed
+    // through the live one. Recording that is what stops the next sweep
+    // cheerfully electing it again; the refresh that follows re-measures it.
+    a.mark_failed(&active_id);
+    if a.select(&id).is_err() {
+        return false;
+    }
+    a.switcher.switches += 1;
+    a.switcher.last_switch = crate::xray::now_secs();
+    a.switcher.last_switch_to = name.clone();
+    a.switcher.last_switch_reason = Reason::Failover.as_str().to_string();
+    let result = a.save_and_apply();
+    drop(a);
+
+    clocks.switch = Some(Instant::now());
+    match result {
+        Ok(()) => eprintln!(
+            "xrayop: the tunnel stopped carrying traffic; moved to \"{name}\" ({latency} ms) -- failover"
+        ),
+        Err(e) => eprintln!("xrayop: moved to \"{name}\" but it would not start: {e}"),
+    }
+    true
+}
+
+/// Measures every server, and adopts a clearly better one when asked to.
+///
+/// Only ever called for [`Reason::Scheduled`] and [`Reason::Refresh`]; a
+/// failover is handled by [`escape_dead_tunnel`] before any of this, because it
+/// must not wait for a measurement.
 ///
 /// Returns whether the sweep actually ran.
-fn run_sweep(app: &Arc<Mutex<App>>, reason: &'static str, last_switch: &mut Option<Instant>) -> bool {
+fn run_sweep(app: &Arc<Mutex<App>>, reason: Reason, clocks: &mut Clocks) -> bool {
     let (nodes, settings, runtime, gate) = {
         let a = lock(app);
         (
@@ -168,7 +328,11 @@ fn run_sweep(app: &Arc<Mutex<App>>, reason: &'static str, last_switch: &mut Opti
         Ok(o) => o,
         Err(e) => {
             eprintln!("xrayop: automatic sweep failed: {e}");
-            return true; // it ran; it just did not produce anything usable
+            // Nothing was measured, so nothing was learned. Reporting this as a
+            // completed sweep used to reset the user's interval, meaning a
+            // setup fault that fails instantly could burn four hours at a time
+            // and never actually test anything.
+            return false;
         }
     };
 
@@ -183,7 +347,23 @@ fn run_sweep(app: &Arc<Mutex<App>>, reason: &'static str, last_switch: &mut Opti
     let (Some(active), Some(best)) = (active, best) else {
         return true;
     };
-    if best.id == active.id || !is_worth_switching(active.latency, best.latency) {
+    if best.id == active.id {
+        return true;
+    }
+
+    // A refresh exists to keep the numbers current, not to move anyone. The
+    // one exception is a current server that has stopped working outright:
+    // leaving the LAN on that until the user's next interval would be perverse.
+    let wanted = match reason {
+        Reason::Refresh => active.latency < 0,
+        _ => is_worth_switching(active.latency, best.latency),
+    };
+    if !wanted {
+        return true;
+    }
+    // The flap floor applies to taste, not to survival: a dead current server
+    // is escaped regardless of how recently something else changed.
+    if active.latency >= 0 && clocks.switch.map(|t| t.elapsed() < MIN_GAP).unwrap_or(false) {
         return true;
     }
 
@@ -194,15 +374,18 @@ fn run_sweep(app: &Arc<Mutex<App>>, reason: &'static str, last_switch: &mut Opti
     a.switcher.switches += 1;
     a.switcher.last_switch = crate::xray::now_secs();
     a.switcher.last_switch_to = best.name.clone();
-    a.switcher.last_switch_reason = reason.to_string();
+    a.switcher.last_switch_reason = reason.as_str().to_string();
     let result = a.save_and_apply();
     drop(a);
 
-    *last_switch = Some(Instant::now());
+    clocks.switch = Some(Instant::now());
     match result {
         Ok(()) => eprintln!(
-            "xrayop: switched to \"{}\" ({} ms, was {} ms) -- {reason}",
-            best.name, best.latency, active.latency
+            "xrayop: switched to \"{}\" ({} ms, was {} ms) -- {}",
+            best.name,
+            best.latency,
+            active.latency,
+            reason.as_str()
         ),
         Err(e) => eprintln!("xrayop: switched to \"{}\" but it would not start: {e}", best.name),
     }
@@ -308,12 +491,70 @@ mod tests {
         assert!(TICK < MIN_GAP);
     }
 
-    /// Failover is the point of the feature; it must react in minutes, not at
-    /// the next scheduled sweep.
+    /// The number the user actually feels: how long the house is offline
+    /// before something is done about it. This used to be three to four
+    /// minutes and was reported as "it never switches".
     #[test]
-    fn failover_reacts_far_faster_than_the_schedule() {
-        let probe_interval = Duration::from_secs(60);
-        let time_to_failover = probe_interval * FAILURES_BEFORE_FAILOVER + TICK;
-        assert!(time_to_failover <= Duration::from_secs(300));
+    fn a_dead_tunnel_is_acted_on_within_a_minute() {
+        let probe_interval = crate::health::probe_interval();
+        let detect = probe_interval * FAILURES_BEFORE_FAILOVER + TICK;
+        assert!(
+            detect <= Duration::from_secs(60),
+            "detection takes {detect:?}; the LAN is offline for all of it"
+        );
+    }
+
+    /// Escaping a dead tunnel and preferring a nicer server are different
+    /// questions and must not share a floor. Waiting out the anti-flap gap
+    /// while nothing works is how a four-minute outage becomes a nine-minute
+    /// one.
+    #[test]
+    fn escaping_is_not_held_to_the_anti_flap_floor() {
+        assert!(ESCAPE_GAP < MIN_GAP);
+        // Long enough for the health probe to reach a verdict on the server we
+        // just moved to, so a run of dead servers is walked, not thrashed.
+        let verdict = crate::health::probe_interval() * FAILURES_BEFORE_FAILOVER;
+        assert!(ESCAPE_GAP >= verdict, "we would move again before knowing");
+    }
+
+    /// The failover path deliberately does not consult `is_worth_switching`.
+    /// This is the bug that left the LAN offline indefinitely: a throttled
+    /// server measures fine from a fresh probe, so the decay rule answered
+    /// "not clearly better, stay" while nothing was getting through.
+    #[test]
+    fn the_decay_rule_would_have_refused_the_switch_failover_makes() {
+        // Typical numbers from the live router: the failing server still
+        // measures 120 ms in isolation, the best alternative is 100 ms.
+        assert!(
+            !is_worth_switching(120, 100),
+            "if this ever passes, the two paths have converged and the \
+             separate failover path is no longer proving anything"
+        );
+    }
+
+    /// Measuring is not switching. The user's interval governs how often the
+    /// panel may change servers; the refresh only keeps the numbers current,
+    /// so a failover has something recent to choose from.
+    #[test]
+    fn refreshing_is_far_more_frequent_than_switching() {
+        let user_interval = Duration::from_secs(240 * 60);
+        assert!(REFRESH_EVERY < user_interval / 4);
+        // But not so often that an armv7 router spends its life sweeping.
+        assert!(REFRESH_EVERY >= Duration::from_secs(10 * 60));
+    }
+
+    #[test]
+    fn reasons_are_named_for_the_log() {
+        assert_eq!(Reason::Failover.as_str(), "failover");
+        assert_eq!(Reason::Scheduled.as_str(), "scheduled");
+        assert_eq!(Reason::Refresh.as_str(), "refresh");
+    }
+
+    /// A WAN check that cannot run must not be the reason a dead server is
+    /// kept -- it exists to suppress failover, so it fails open.
+    #[test]
+    fn an_unusable_wan_check_does_not_block_failover() {
+        assert!(crate::health::wan_reachable(""));
+        assert!(crate::health::wan_reachable("not-an-address"));
     }
 }
