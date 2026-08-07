@@ -5,7 +5,7 @@ A transparent proxy manager for OpenWrt routers: one small Rust daemon, one fast
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platform: OpenWrt](https://img.shields.io/badge/platform-OpenWrt%2022.03%2B-00B5E2.svg)](https://openwrt.org/)
 [![Language: Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
-[![Release](https://img.shields.io/badge/release-v0.2.0-brightgreen.svg)](#installation)
+[![Release](https://img.shields.io/badge/release-v0.2.1-brightgreen.svg)](#installation)
 
 kochsar panel drives [Xray-core](https://github.com/XTLS/Xray-core) on your router so that every device in the
 house goes through the tunnel without being configured one by one. It gives you a panel that behaves like
@@ -42,14 +42,16 @@ the whole network. It is a lightweight replacement for Passwall2: the same job, 
   breaks, doing nothing fixes it.
 - **A health watchdog.** A core that dies is restarted. A core that cannot be kept alive has its firewall rules
   torn down so the LAN falls back to a direct connection — and they are put back automatically when it recovers.
-- **Automatic failover.** Optional: test every server on your own schedule and move to a clearly better one.
-  Measurement never runs through the tunnel that is currently in use.
+- **Automatic failover, in about a minute.** When the tunnel stops carrying traffic the panel moves to a
+  server it knows works — measured, not guessed — typically within 50 seconds of the outage starting. On your
+  own schedule it will also adopt a clearly better server. Measurement never runs through the tunnel in use,
+  and if your *own* internet is what went down it says so and waits instead of cycling through the list.
 - **Bilingual.** English by default, Persian (RTL) one tap away. Soft-UI dark theme.
 - **Light on the router.** A single static binary under 1 MB, no C toolchain, and a short dependency list. The
   whole stack measured **38.6 MB** of RAM against Passwall2's **51.2 MB** carrying the same traffic on the same
   router.
 
-> **Status:** version 0.2.0. Transparent proxying, tunnelled DNS, crash recovery, a firmware upgrade, a reboot,
+> **Status:** version 0.2.1. Transparent proxying, tunnelled DNS, crash recovery, a firmware upgrade, a reboot,
 > the WAN-reconnect hook and the installer have all been exercised on a real router carrying a real LAN. What is
 > not yet established is long-run behaviour under heavy use — treat this as an early release and keep SSH access
 > handy.
@@ -62,7 +64,7 @@ Everything above was verified on exactly this hardware, and nowhere else yet:
 |---|---|
 | **Router** | Google WiFi — AC-1304 (board name `Gale`) |
 | **SoC / target** | IPQ4019, ARMv7 rev 5 (v7l), 4 cores — OpenWrt target `ipq40xx/chromium` |
-| **OpenWrt** | 25.12.2 (r32802-f505120278) |
+| **OpenWrt** | 25.12.5 (r33051-f5dae5ece4) |
 | **Xray-core** | 26.3.27 (the version in OpenWrt's own feed) |
 | **RAM** | 494 MB total |
 
@@ -95,12 +97,12 @@ follow [docs/INSTALL.md](docs/INSTALL.md) instead; it walks through the same ste
 ### The short version
 
 **1. Download** the release tarball for your architecture from the Releases page, for example
-`xrayop-0.2.0-armv7-unknown-linux-musleabihf.tar.gz`.
+`xrayop-0.2.1-armv7-unknown-linux-musleabihf.tar.gz`.
 
 **2. Copy it to the router:**
 
 ```bash
-scp -O xrayop-0.2.0-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
+scp -O xrayop-0.2.1-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
 ```
 
 > `-O` is not a typo. OpenWrt's SSH server (dropbear) ships without `sftp-server`, and modern `scp` uses SFTP by
@@ -113,8 +115,8 @@ scp -O xrayop-0.2.0-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
 ```bash
 ssh root@ROUTER_IP
 cd /tmp
-tar xzf xrayop-0.2.0-*.tar.gz
-cd xrayop-0.2.0-*/
+tar xzf xrayop-0.2.1-*.tar.gz
+cd xrayop-0.2.1-*/
 sh install.sh
 ```
 
@@ -246,7 +248,7 @@ The uninstaller is in the release tarball you extracted:
 
 ```bash
 ssh root@ROUTER_IP
-cd /tmp/xrayop-0.2.0-*/
+cd /tmp/xrayop-0.2.1-*/
 sh uninstall.sh            # keeps your server list and settings
 sh uninstall.sh --purge    # removes those too
 ```

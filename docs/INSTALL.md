@@ -168,7 +168,7 @@ folder and copy the file over:
 
 ```
 cd Downloads
-scp -O xrayop-0.2.0-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
+scp -O xrayop-0.2.1-armv7-unknown-linux-musleabihf.tar.gz root@ROUTER_IP:/tmp/
 ```
 
 Adjust the filename to whatever you actually downloaded.
@@ -191,7 +191,7 @@ It asks for the router password again, then shows a progress bar. The file is ab
 this instead, which works everywhere:
 
 ```
-cat xrayop-0.2.0-armv7-unknown-linux-musleabihf.tar.gz | ssh root@ROUTER_IP "cat > /tmp/xrayop.tar.gz"
+cat xrayop-0.2.1-armv7-unknown-linux-musleabihf.tar.gz | ssh root@ROUTER_IP "cat > /tmp/xrayop.tar.gz"
 ```
 
 (If you use that form, the file on the router is called `/tmp/xrayop.tar.gz` — remember that in step 5.)
@@ -210,8 +210,8 @@ Back in the SSH window (or open a new one with `ssh root@ROUTER_IP`):
 
 ```sh
 cd /tmp
-tar xzf xrayop-0.2.0-*.tar.gz
-cd xrayop-0.2.0-*/
+tar xzf xrayop-0.2.1-*.tar.gz
+cd xrayop-0.2.1-*/
 sh install.sh
 ```
 
@@ -395,7 +395,7 @@ Yes. Edit `/etc/config/xrayop`, change the `listen` line, then `/etc/init.d/xray
 **How do I remove it?**
 
 ```sh
-cd /tmp/xrayop-0.2.0-*/
+cd /tmp/xrayop-0.2.1-*/
 sh uninstall.sh            # keeps your server list
 sh uninstall.sh --purge    # removes everything
 ```
