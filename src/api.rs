@@ -119,7 +119,7 @@ fn dispatch(app: &Arc<Mutex<App>>, mut request: Request) {
                 "/api/nodes/add" => handle_nodes_add(app, &body),
                 "/api/nodes/remove" => handle_node_remove(app, &body),
                 "/api/select" => handle_select(app, &body),
-                "/api/test" => handle_test(app),
+                "/api/test" => handle_test(app, &body),
                 "/api/dns" => handle_dns(app, &body),
                 "/api/settings" => handle_settings(app, &body),
                 "/api/service" => handle_service(app, &body),
@@ -371,18 +371,38 @@ fn handle_select(app: &Arc<Mutex<App>>, body: &Value) -> Body {
     finish_write(app, json!({ "ok": true, "active": id }))
 }
 
-fn handle_test(app: &Arc<Mutex<App>>) -> Body {
+/// Measures every server, or just one when the body names it.
+///
+/// The single-node form is what the panel's home screen uses: tapping the
+/// latency beside the server you are on should re-check *that* server, and
+/// measuring the other thirty to answer it would take twenty seconds for no
+/// reason.
+fn handle_test(app: &Arc<Mutex<App>>, body: &Value) -> Body {
+    let only = str_field(body, "id");
+
     let (nodes, settings, runtime, gate) = {
         let a = lock(app);
+        let nodes: Vec<_> = if only.is_empty() {
+            a.state.nodes.clone()
+        } else {
+            a.state.nodes.iter().filter(|n| n.id == only).cloned().collect()
+        };
         (
-            a.state.nodes.clone(),
+            nodes,
             a.state.settings.clone(),
             a.sup.runtime_dir().to_path_buf(),
             Arc::clone(&a.probing),
         )
     };
     if nodes.is_empty() {
-        return error(400, "there are no nodes to test");
+        return error(
+            400,
+            if only.is_empty() {
+                "there are no nodes to test"
+            } else {
+                "no such server"
+            },
+        );
     }
 
     // One sweep at a time. A large list takes tens of seconds and starts a
@@ -405,17 +425,20 @@ fn handle_test(app: &Arc<Mutex<App>>) -> Body {
     let best = a
         .fastest()
         .map(|n| json!({ "id": n.id, "name": n.name, "latency": n.latency }));
-    let total = a.state.nodes.len();
+    // What this particular test measured, so a single-server check can be
+    // reported without the caller re-reading the whole list.
+    let measured = a.state.find(&only).map(|n| n.latency);
     let _ = a.save();
     drop(a);
 
     json_ok(json!({
         "ok": true,
-        "tested": total.min(latency::MAX_NODES),
+        "tested": nodes.len().min(latency::MAX_NODES),
         "reachable": reachable,
         "skipped": outcome.skipped,
         "url": url,
         "best": best,
+        "latency": measured,
     }))
 }
 
@@ -1514,6 +1537,22 @@ mod tests {
     /// The panel used to name VLESS in its own text and tag only REALITY, so a
     /// Trojan node and a VLESS node on one host were indistinguishable. It now
     /// shows what each server is, which means it has to be told.
+    /// Tapping the latency on the home card re-checks the server you are on.
+    /// It has to reach a handler that measures one server: sweeping all
+    /// thirty to answer a question about one takes twenty seconds, and the
+    /// spinner would be sitting there for all of them.
+    #[test]
+    fn the_home_card_latency_asks_to_re_measure_one_server() {
+        assert!(
+            INDEX_HTML.contains(r#"api("/api/test", { id: state.active })"#),
+            "the re-test must name the active server, not sweep everything"
+        );
+        assert!(
+            INDEX_HTML.contains("ev.stopPropagation()"),
+            "the card underneath navigates away; the button has to stop it"
+        );
+    }
+
     #[test]
     fn the_panel_is_told_what_protocol_each_node_is() {
         assert!(

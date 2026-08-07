@@ -112,6 +112,23 @@ main{flex:1; width:100%; max-width:640px; margin:0 auto; padding:12px 20px 24px}
 .pick .lbl{font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.8px}
 .pick .val{font-weight:600; margin-top:2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .chev{color:var(--muted); flex:none}
+/* The latency on the home card doubles as a re-test button. It has to stay
+   readable as a value first and only suggest tappability, or it reads as a
+   control that happens to have a number in it. */
+.ms-retest{
+  border:0; background:transparent; padding:4px 8px; margin:-4px -2px; border-radius:9px;
+  font:inherit; color:inherit; cursor:pointer; flex:none;
+  display:flex; align-items:center; gap:6px;
+}
+.ms-retest:hover{box-shadow:inset 2px 2px 5px var(--sh-dark), inset -2px -2px 5px var(--sh-light)}
+.ms-retest:active{transform:scale(.96)}
+.ms-retest:disabled{cursor:default; opacity:.6}
+.ms-retest .spin{
+  width:12px; height:12px; border-radius:50%; flex:none;
+  border:2px solid var(--accent-soft); border-top-color:var(--accent);
+  animation:spin .7s linear infinite;
+}
+@keyframes spin{to{transform:rotate(360deg)}}
 
 /* ---------- controls ---------- */
 button.btn{
@@ -319,7 +336,7 @@ pre.log{
         <div class="lbl" data-t="location">Location</div>
         <div class="val" id="activeName">—</div>
       </div>
-      <div class="ms" id="activeMs"></div>
+      <button class="ms-retest" id="activeMs" type="button"></button>
       <svg class="chev" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 5l7 7-7 7"/></svg>
     </div>
   </section>
@@ -616,6 +633,7 @@ const I18N = {
     repoHint:"Source code, releases and issues", mailHint:"Feedback and questions",
     socksAt:"SOCKS5 proxy", httpAt:"HTTP proxy", state:"State file", version:"Version",
     untested:"—", failed:"down",
+    retestOne:"Tap to measure this server again", retestFailed:"This server did not answer",
     savedNotStarted:"Saved, but it would not start:",
     offline:"Cannot reach the service",
     confirmDelete:"Delete server \"{0}\"?", confirmDeleteSub:"Delete this subscription and all its servers?",
@@ -686,6 +704,7 @@ const I18N = {
     repoHint:"سورس‌کد، نسخه‌ها و گزارش مشکل", mailHint:"بازخورد و پرسش",
     socksAt:"پراکسی SOCKS5", httpAt:"پراکسی HTTP", state:"فایل تنظیمات", version:"نسخه",
     untested:"—", failed:"قطع",
+    retestOne:"برای سنجش دوبارهٔ همین سرور بزنید", retestFailed:"این سرور پاسخ نداد",
     savedNotStarted:"ذخیره شد ولی اجرا نشد:",
     offline:"ارتباط با سرویس برقرار نیست",
     confirmDelete:"سرور «{0}» حذف شود؟", confirmDeleteSub:"این اشتراک و همهٔ سرورهایش حذف شوند؟",
@@ -804,6 +823,22 @@ async function run(fn, okMsg) {
   }
 }
 
+/* The latency on the home card, which is also the button that re-measures it.
+   Held in its own function because a running test has to survive the six-second
+   state poll -- otherwise the spinner is wiped a moment after it appears. */
+let retesting = false;
+function renderActiveMs(active) {
+  const box = $("#activeMs");
+  box.replaceChildren();
+  box.disabled = retesting || !active;
+  box.title = active ? t("retestOne") : "";
+  if (retesting) {
+    box.appendChild(el("div", "spin"));
+    return;
+  }
+  if (active) box.appendChild(latency(active.latency));
+}
+
 function latency(ms) {
   const n = el("div", "ms");
   if (ms === -1) { n.classList.add("n"); n.textContent = t("untested"); }
@@ -839,9 +874,7 @@ function render() {
   text(label, on ? t("connected") : state.active ? t("notConnected") : t("noServer"));
 
   text($("#activeName"), active ? active.name : "—");
-  const ms = $("#activeMs");
-  ms.replaceChildren();
-  if (active) ms.appendChild(latency(active.latency));
+  renderActiveMs(active);
 
   const banner = $("#banner");
   banner.replaceChildren();
@@ -1115,6 +1148,29 @@ $("#swRouterTraffic").onclick = () =>
   run(() => api("/api/settings", { route_router_traffic: !state.settings.route_router_traffic }));
 
 $("#pickServer").onclick = () => $$(".tabbar button")[1].click();
+
+/* Re-measure just the server you are on. Deliberately not run() -- that
+   disables every button on the page and shows a toast, which is far too much
+   ceremony for re-checking one number, and it would hide the spinner that is
+   the actual feedback here. */
+$("#activeMs").onclick = async (ev) => {
+  // The card underneath navigates to the server list.
+  ev.stopPropagation();
+  if (retesting || !state || !state.active) return;
+
+  retesting = true;
+  renderActiveMs(state.nodes.find(n => n.active));
+  try {
+    const r = await api("/api/test", { id: state.active });
+    retesting = false;
+    await refresh();
+    if (r && r.latency != null && r.latency < 0) toast(t("retestFailed"), "bad");
+  } catch (e) {
+    retesting = false;
+    toast(e.message || String(e), "bad");
+    render();
+  }
+};
 
 $("#power").onclick = () => {
   const on = state && state.status.running;
