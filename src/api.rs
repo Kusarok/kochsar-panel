@@ -706,21 +706,57 @@ fn apply_settings(mut next: crate::model::Settings, body: &Value) -> Result<crat
 fn handle_service(app: &Arc<Mutex<App>>, body: &Value) -> Body {
     match str_field(body, "action").as_str() {
         "stop" => {
+            // Without the pause the health watchdog resurrects the core within
+            // one tick -- it cannot tell "stopped on purpose" from "died".
+            //
+            // In transparent mode the rules come down with the core, before it
+            // stops: a stopped core behind loaded rules strands the LAN, and
+            // the revert-first order is what keeps the gap from black-holing
+            // traffic. They go back on start.
+            let transparent = {
+                let a = lock(app);
+                a.state.settings.transparent && a.tproxy_applied
+            };
+            if transparent {
+                let plan = lock(app).tproxy_plan(Vec::new());
+                tproxy::revert(&plan);
+                let _ = dnsmasq::remove();
+                let mut a = lock(app);
+                a.tproxy_applied = false;
+                a.dns_via_tunnel = false;
+                a.dns_domains.clear();
+            }
             let mut a = lock(app);
+            // Disarm a pending probation: a late watchdog rollback would
+            // restart the core this stop just paused.
+            a.tproxy_guard.disarm();
+            a.tproxy_deadline = 0;
             a.sup.stop();
             a.sup.last_error.clear();
+            a.core_paused = true;
             json_ok(json!({ "ok": true, "running": false }))
         }
         "start" | "restart" => {
-            let mut a = lock(app);
-            if a.state.active.is_empty() {
-                return error(400, "select a node first");
-            }
-            match a.save_and_apply() {
-                Ok(()) => {
-                    let running = a.sup.is_running();
-                    json_ok(json!({ "ok": true, "running": running }))
+            let (result, running, restore) = {
+                let mut a = lock(app);
+                if a.state.active.is_empty() {
+                    return error(400, "select a node first");
                 }
+                a.core_paused = false;
+                // A start after a stop in transparent mode has to put the
+                // rules back; they came down with the stop.
+                let restore = a.state.settings.transparent && !a.tproxy_applied;
+                let result = a.save_and_apply();
+                let running = a.sup.is_running();
+                (result, running, restore)
+            };
+            // Core first, rules second -- the same order as tproxy enable. No
+            // core, no rules: pointing the LAN at a dead port strands it.
+            if restore && result.is_ok() && running {
+                crate::health::restore_rules(app);
+            }
+            match result {
+                Ok(()) => json_ok(json!({ "ok": true, "running": running })),
                 Err(e) => error(500, &e),
             }
         }
@@ -739,7 +775,12 @@ fn handle_network_changed(app: &Arc<Mutex<App>>, body: &Value) -> Body {
     let event = str_field(body, "event");
     let (enabled, transparent) = {
         let a = lock(app);
-        (a.state.settings.core_enabled(), a.state.settings.transparent)
+        // A paused core stays down across a WAN reconnect too: the hotplug
+        // hook is not the user asking it to start again.
+        (
+            a.state.settings.core_enabled() && !a.core_paused,
+            a.state.settings.transparent,
+        )
     };
     if !enabled {
         return json_ok(json!({ "ok": true, "action": "none" }));
@@ -800,8 +841,10 @@ fn handle_mode(app: &Arc<Mutex<App>>, body: &Value) -> Body {
         // Reset the health counters: a mode change is a fresh start, and a
         // "degraded" badge from the previous mode would be misleading.
         a.health.degraded = false;
+        a.health.tunnel_unwound = false;
         a.health.failures = 0;
         a.health.last_failure.clear();
+        a.core_paused = false;
     }
 
     if mode == "global" {

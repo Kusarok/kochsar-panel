@@ -70,6 +70,17 @@ const ESCAPE_GAP: Duration = Duration::from_secs(60);
 /// something to bet the household's internet on.
 const REFRESH_EVERY: Duration = Duration::from_secs(30 * 60);
 
+/// When the first background sweep of a daemon run happens, if nothing has
+/// ever been measured.
+///
+/// Failover picks its replacement from the stored table, so the table has to
+/// exist. A fresh install -- every server untested -- otherwise spent up to
+/// thirty minutes of a dead tunnel waiting for the first measurement, and
+/// "failover never works" was the report. Sixty seconds is long after the
+/// core has settled, so the reason a sweep at second zero is ruled out does
+/// not apply.
+const FIRST_SWEEP_AFTER: Duration = Duration::from_secs(60);
+
 /// A replacement must beat the current server by at least this fraction...
 const BETTER_BY: f64 = 0.80;
 /// ...and by at least this many milliseconds. Both, so neither a tiny
@@ -134,6 +145,8 @@ impl Reason {
 struct Clocks {
     scheduled: Instant,
     refresh: Instant,
+    /// When the daemon started, for [`FIRST_SWEEP_AFTER`].
+    started: Instant,
     /// Last *quality* switch, for [`MIN_GAP`].
     switch: Option<Instant>,
     /// Last attempt to escape a dead tunnel, for [`ESCAPE_GAP`]. Recorded even
@@ -145,11 +158,14 @@ struct Clocks {
 pub fn spawn(app: Arc<Mutex<App>>) {
     thread::spawn(move || {
         // Not zero: a sweep the instant the daemon starts would run before the
-        // core has finished coming up and report everything as failed.
+        // core has finished coming up and report everything as failed. The
+        // first one runs after [`FIRST_SWEEP_AFTER`] instead of a full
+        // [`REFRESH_EVERY`] -- see `due`.
         let now = Instant::now();
         let mut clocks = Clocks {
             scheduled: now,
             refresh: now,
+            started: now,
             switch: None,
             escape: None,
         };
@@ -162,11 +178,15 @@ pub fn spawn(app: Arc<Mutex<App>>) {
             match reason {
                 Reason::Failover => {
                     clocks.escape = Some(Instant::now());
+                    let swept = clocks.refresh;
                     if escape_dead_tunnel(&app, &mut clocks) {
                         // Refresh afterwards so the next failure has current
                         // numbers to choose from, and so the server we just
                         // left is measured again rather than left guessed at.
-                        if run_sweep(&app, Reason::Refresh, &mut clocks) {
+                        // Escape already swept when it had to build the table
+                        // itself; a second sweep back to back learns nothing.
+                        if clocks.refresh == swept && run_sweep(&app, Reason::Refresh, &mut clocks)
+                        {
                             clocks.refresh = Instant::now();
                         }
                     }
@@ -193,12 +213,14 @@ fn due(app: &Arc<Mutex<App>>, clocks: &Clocks) -> Option<Reason> {
     if !a.state.settings.auto_switch || a.state.nodes.len() < 2 {
         return None;
     }
-    // Nothing to fail over from, and nothing to fail over to.
-    if a.state.active.is_empty() || !a.state.settings.core_enabled() {
+    // Nothing to fail over from, and nothing to fail over to. A paused core
+    // is the user's explicit choice, and switching would restart it.
+    if a.state.active.is_empty() || !a.state.settings.core_enabled() || a.core_paused {
         return None;
     }
 
     let failing = a.health.probe_failures >= FAILURES_BEFORE_FAILOVER;
+    let never_swept = a.switcher.last_sweep == 0;
     let interval = Duration::from_secs(a.state.settings.auto_switch_minutes.max(1) as u64 * 60);
     drop(a);
 
@@ -217,7 +239,12 @@ fn due(app: &Arc<Mutex<App>>, clocks: &Clocks) -> Option<Reason> {
     if clocks.scheduled.elapsed() >= interval {
         return Some(Reason::Scheduled);
     }
-    if clocks.refresh.elapsed() >= REFRESH_EVERY {
+    // The first sweep of a daemon run comes early: until something has been
+    // measured, failover has no table to pick from, and thirty minutes is a
+    // long time to find that out. Sixty seconds is long after the core has
+    // settled, so the startup concern above does not apply.
+    let first_sweep_due = never_swept && clocks.started.elapsed() >= FIRST_SWEEP_AFTER;
+    if first_sweep_due || clocks.refresh.elapsed() >= REFRESH_EVERY {
         return Some(Reason::Refresh);
     }
     None
@@ -239,7 +266,8 @@ fn due(app: &Arc<Mutex<App>>, clocks: &Clocks) -> Option<Reason> {
 /// works. Asking instead "which other server is known to work" is the fix.
 ///
 /// No sweep first: measuring 31 servers takes twenty seconds the household
-/// spends offline. The stored table is refreshed afterwards.
+/// spends offline. The stored table is refreshed afterwards. The one exception
+/// is an empty table -- see below.
 fn escape_dead_tunnel(app: &Arc<Mutex<App>>, clocks: &mut Clocks) -> bool {
     let (resolver, active_id) = {
         let a = lock(app);
@@ -256,11 +284,34 @@ fn escape_dead_tunnel(app: &Arc<Mutex<App>>, clocks: &mut Clocks) -> bool {
         return false;
     }
 
-    let pick = {
+    let mut pick = {
         let a = lock(app);
         a.fastest_other(&active_id)
             .map(|n| (n.id.clone(), n.name.clone(), n.latency))
     };
+
+    if pick.is_none() {
+        // The table has nothing to offer: nothing was ever measured, or
+        // everything else is already marked failed. "No sweep first" stops
+        // applying here -- measuring costs the LAN twenty seconds it is
+        // already spending offline, while refusing used to cost it up to
+        // thirty minutes: the whole gap until the next refresh. This was the
+        // "server died and nothing switched" report.
+        if run_sweep(app, Reason::Refresh, clocks) {
+            clocks.refresh = Instant::now();
+            // The sweep moves on its own when the active server measures
+            // dead; if it did, there is nothing left to escape from.
+            if lock(app).state.active != active_id {
+                return true;
+            }
+        }
+        pick = {
+            let a = lock(app);
+            a.fastest_other(&active_id)
+                .map(|n| (n.id.clone(), n.name.clone(), n.latency))
+        };
+    }
+
     let Some((id, name, latency)) = pick else {
         eprintln!(
             "xrayop: the tunnel is down and no other server has a working measurement; \
@@ -541,6 +592,24 @@ mod tests {
         assert!(REFRESH_EVERY < user_interval / 4);
         // But not so often that an armv7 router spends its life sweeping.
         assert!(REFRESH_EVERY >= Duration::from_secs(10 * 60));
+    }
+
+    /// Failover picks from the stored table, so the table has to exist. A
+    /// fresh install measured nothing until the first refresh, thirty minutes
+    /// in -- and a dead server in that window was reported as "it never
+    /// switches". The first sweep must be early, but not second zero: the
+    /// core has to be up first.
+    #[test]
+    fn the_first_sweep_is_early_but_not_instant() {
+        assert!(
+            FIRST_SWEEP_AFTER >= Duration::from_secs(30),
+            "a sweep at boot measures a core that is still starting"
+        );
+        assert!(
+            FIRST_SWEEP_AFTER <= Duration::from_secs(120),
+            "failover needs a table within minutes, not half an hour"
+        );
+        assert!(FIRST_SWEEP_AFTER < REFRESH_EVERY / 4);
     }
 
     #[test]
