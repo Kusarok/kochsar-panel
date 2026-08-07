@@ -81,6 +81,20 @@ const REFRESH_EVERY: Duration = Duration::from_secs(30 * 60);
 /// not apply.
 const FIRST_SWEEP_AFTER: Duration = Duration::from_secs(60);
 
+/// Shortest gap between two sweep *attempts*, whatever asked for them.
+///
+/// A sweep that measured nothing deliberately does not reset the clock that
+/// asked for it -- a setup fault would otherwise burn a four-hour interval at
+/// a time having learned nothing. The cost of that is a condition which stays
+/// true, so without a floor here the next tick tries again, and the next:
+/// `latency::measure` fails in milliseconds when the core binary is missing or
+/// no ports are free, so the retry costs a log line every ten seconds forever.
+///
+/// A missing core binary is not hypothetical -- a firmware upgrade removed
+/// this router's, and the daemon ran for hours with settings, servers and no
+/// core.
+const SWEEP_RETRY_GAP: Duration = Duration::from_secs(60);
+
 /// A replacement must beat the current server by at least this fraction...
 const BETTER_BY: f64 = 0.80;
 /// ...and by at least this many milliseconds. Both, so neither a tiny
@@ -147,6 +161,12 @@ struct Clocks {
     refresh: Instant,
     /// When the daemon started, for [`FIRST_SWEEP_AFTER`].
     started: Instant,
+    /// Last sweep *attempt*, successful or not, for [`SWEEP_RETRY_GAP`].
+    ///
+    /// Separate from `scheduled` and `refresh`, which record what was
+    /// *learned*: an attempt that measured nothing must not push the user's
+    /// interval out, but must still be rate-limited.
+    attempted: Option<Instant>,
     /// Last *quality* switch, for [`MIN_GAP`].
     switch: Option<Instant>,
     /// Last attempt to escape a dead tunnel, for [`ESCAPE_GAP`]. Recorded even
@@ -166,6 +186,7 @@ pub fn spawn(app: Arc<Mutex<App>>) {
             scheduled: now,
             refresh: now,
             started: now,
+            attempted: None,
             switch: None,
             escape: None,
         };
@@ -236,6 +257,14 @@ fn due(app: &Arc<Mutex<App>>, clocks: &Clocks) -> Option<Reason> {
         // the scheduled sweep as well, so a spell of failures could postpone
         // the user's interval indefinitely.
     }
+    // Every sweep shares one retry floor. A sweep that measured nothing does
+    // not consume the interval that asked for it -- otherwise a setup fault
+    // burns four hours at a time -- but it must not be retried on the next
+    // tick either. See [`SWEEP_RETRY_GAP`].
+    if !may_attempt_sweep(clocks.attempted) {
+        return None;
+    }
+
     if clocks.scheduled.elapsed() >= interval {
         return Some(Reason::Scheduled);
     }
@@ -248,6 +277,17 @@ fn due(app: &Arc<Mutex<App>>, clocks: &Clocks) -> Option<Reason> {
         return Some(Reason::Refresh);
     }
     None
+}
+
+/// Whether enough time has passed since the last sweep *attempt*.
+///
+/// Split out so the rule can be tested without an [`App`]; the storm it
+/// prevents is otherwise only visible in a log growing by thousands of lines a
+/// day.
+fn may_attempt_sweep(attempted: Option<Instant>) -> bool {
+    attempted
+        .map(|t| t.elapsed() >= SWEEP_RETRY_GAP)
+        .unwrap_or(true)
 }
 
 /// The tunnel is not carrying traffic. Move to another server now.
@@ -353,6 +393,12 @@ fn escape_dead_tunnel(app: &Arc<Mutex<App>>, clocks: &mut Clocks) -> bool {
 ///
 /// Returns whether the sweep actually ran.
 fn run_sweep(app: &Arc<Mutex<App>>, reason: Reason, clocks: &mut Clocks) -> bool {
+    // Recorded here rather than at the call sites so every path is covered --
+    // including the one `escape_dead_tunnel` takes when it has to build the
+    // table itself. What follows can fail in several ways that leave the
+    // asking condition still true.
+    clocks.attempted = Some(Instant::now());
+
     let (nodes, settings, runtime, gate) = {
         let a = lock(app);
         (
@@ -610,6 +656,40 @@ mod tests {
             "failover needs a table within minutes, not half an hour"
         );
         assert!(FIRST_SWEEP_AFTER < REFRESH_EVERY / 4);
+    }
+
+    /// A sweep that measures nothing leaves the condition that asked for it
+    /// still true. Without a floor between attempts the next tick tries again
+    /// -- and `latency::measure` fails in milliseconds when the core binary is
+    /// missing, so the loop costs a log line every ten seconds indefinitely.
+    /// This router has been in exactly that state: a firmware upgrade removed
+    /// its xray.
+    #[test]
+    fn a_sweep_that_measures_nothing_is_not_retried_on_the_next_tick() {
+        assert!(may_attempt_sweep(None), "nothing tried yet");
+        assert!(
+            !may_attempt_sweep(Some(Instant::now())),
+            "an attempt just now must not be repeated immediately"
+        );
+        assert!(
+            SWEEP_RETRY_GAP > TICK * 2,
+            "a floor at or below the tick rate is not a floor"
+        );
+    }
+
+    /// The retry floor must not delay escaping a dead tunnel, which has its
+    /// own gap and is the one thing that cannot wait.
+    #[test]
+    fn the_retry_floor_does_not_apply_to_failover() {
+        let src = include_str!("switcher.rs");
+        let after_failover = src
+            .split_once("return Some(Reason::Failover);")
+            .expect("the failover branch")
+            .1;
+        assert!(
+            after_failover.contains("may_attempt_sweep"),
+            "the floor has to be checked after the failover return, not before"
+        );
     }
 
     #[test]
