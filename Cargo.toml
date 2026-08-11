@@ -1,6 +1,6 @@
 [package]
 name = "xrayop"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 description = "Lightweight Xray manager with a browser panel for OpenWrt routers"
 license = "MIT"

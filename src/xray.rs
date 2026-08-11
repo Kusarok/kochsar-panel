@@ -176,10 +176,10 @@ pub fn build_config(state: &State) -> Option<Value> {
 /// dies of fd exhaustion or OOM. This is the most-reported router failure in
 /// Xray's own issue tracker (#5263, #4586, #4194), maintainer-diagnosed.
 ///
-/// `bufferSize` is deliberately NOT set. On 32-bit ARM Xray already defaults to
-/// no internal buffer, and the value `0` now means *unlimited* rather than
-/// *disabled* -- so copying the widely-repeated "set bufferSize low on routers"
-/// advice from x86 guides would make memory use worse, not better.
+/// `bufferSize` is explicit because Xray's architecture-dependent default is
+/// zero on ARM/MIPS but 4 KiB on ARM64. Xray documents that a value that is too
+/// low can discard UDP writes when the buffer is full, wasting bandwidth. Four
+/// KiB matches the ARM64 default without importing the much larger x86 cost.
 fn build_policy(conn_idle_secs: u32) -> Value {
     json!({
         "levels": {
@@ -187,7 +187,11 @@ fn build_policy(conn_idle_secs: u32) -> Value {
                 "handshake": 4,
                 "connIdle": conn_idle_secs,
                 "uplinkOnly": 2,
-                "downlinkOnly": 2
+                "downlinkOnly": 2,
+                // Xray defaults this to zero on ARM/MIPS, unlike ARM64.  An
+                // explicit small buffer avoids UDP drops on the armv7 router
+                // while keeping the per-connection memory cost predictable.
+                "bufferSize": 4
             }
         },
         "system": { "statsInboundUplink": false, "statsInboundDownlink": false }
@@ -968,7 +972,7 @@ impl Supervisor {
     /// Stops Xray if it is running. Safe to call when it is not.
     pub fn stop(&mut self) {
         if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
+            terminate(&mut child);
             // Reap it so we do not leave a zombie behind.
             let _ = child.wait();
         }
@@ -1019,6 +1023,31 @@ impl Supervisor {
     pub fn config_path(&self) -> &Path {
         &self.paths.config
     }
+}
+
+#[cfg(unix)]
+fn terminate(child: &mut Child) {
+    let pid = child.id().to_string();
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+}
+
+#[cfg(not(unix))]
+fn terminate(child: &mut Child) {
+    let _ = child.kill();
 }
 
 impl Drop for Supervisor {
@@ -1516,6 +1545,13 @@ mod tests {
             let text = build_config(&s).unwrap()["outbounds"][0]["settings"].to_string();
             assert!(text.contains("\"level\":0"), "{uri}: {text}");
         }
+    }
+
+    #[test]
+    fn arm_buffer_is_explicit_and_small() {
+        let s = state_with("vless://u@a.com:443#v");
+        let config = build_config(&s).unwrap();
+        assert_eq!(config["policy"]["levels"]["0"]["bufferSize"], 4);
     }
 
     #[test]

@@ -70,6 +70,15 @@ const PROBE_RESTART_COOLDOWN: Duration = Duration::from_secs(600);
 /// Budget for one deep check. Generous: a slow tunnel is not a broken one.
 const PROBE_TIMEOUT_SECS: u32 = 12;
 
+/// Independent destinations used to distinguish a dead tunnel from one
+/// temporarily unreachable CDN or hostname.  The configured target is tried
+/// first, then enough distinct fallbacks are added for a majority decision.
+const FALLBACK_PROBE_URLS: [&str; 3] = [
+    "https://cp.cloudflare.com/generate_204",
+    "https://www.google.com/generate_204",
+    "https://github.com/robots.txt",
+];
+
 /// How long the tunnel may carry nothing before the rules come down.
 ///
 /// This is the last resort, reached only after failover has had several
@@ -353,7 +362,7 @@ fn run_deep_check(
     url: &str,
     last_restart: &mut Option<Instant>,
 ) -> bool {
-    let ok = request_succeeds(socks_port, url);
+    let ok = tunnel_reachable(socks_port, url);
 
     let failures = {
         let mut a = lock(app);
@@ -444,6 +453,43 @@ fn request_succeeds(socks_port: u16, url: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn tunnel_reachable(socks_port: u16, primary: &str) -> bool {
+    majority_reachable(primary, |url| request_succeeds(socks_port, url))
+}
+
+fn majority_reachable<F>(primary: &str, mut request: F) -> bool
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut urls = Vec::with_capacity(3);
+    urls.push(primary);
+    for candidate in FALLBACK_PROBE_URLS {
+        if !urls.contains(&candidate) {
+            urls.push(candidate);
+        }
+        if urls.len() == 3 {
+            break;
+        }
+    }
+
+    let mut successes = 0;
+    let mut failures = 0;
+    for url in urls {
+        if request(url) {
+            successes += 1;
+            if successes == 2 {
+                return true;
+            }
+        } else {
+            failures += 1;
+            if failures == 2 {
+                return false;
+            }
+        }
+    }
+    successes > failures
+}
+
 /// A poisoned mutex means a handler panicked mid-update. Recovering it is right
 /// here for the same reason as in the API: a router daemon that stops
 /// supervising is worse than one working from slightly stale state.
@@ -528,6 +574,30 @@ mod tests {
         assert!(!s.degraded);
         assert!(!s.tunnel_unwound);
         assert!(s.last_failure.is_empty());
+    }
+
+    #[test]
+    fn two_destinations_must_agree_that_the_tunnel_is_healthy() {
+        let mut outcomes = [true, false, true].into_iter();
+        assert!(majority_reachable("https://primary.example/", |_| {
+            outcomes.next().unwrap()
+        }));
+
+        let mut outcomes = [false, true, false].into_iter();
+        assert!(!majority_reachable("https://primary.example/", |_| {
+            outcomes.next().unwrap()
+        }));
+    }
+
+    #[test]
+    fn a_duplicate_primary_still_gets_three_independent_targets() {
+        let mut seen = Vec::new();
+        let _ = majority_reachable(FALLBACK_PROBE_URLS[0], |url| {
+            seen.push(url.to_string());
+            true
+        });
+        assert_eq!(seen.len(), 2, "two successes are enough for a decision");
+        assert_ne!(seen[0], seen[1]);
     }
 
     /// The flap this module once had: a dead-tunnel unwind was undone one tick

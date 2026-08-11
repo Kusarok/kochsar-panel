@@ -238,12 +238,16 @@ impl App {
     /// A paused core is only saved, not started: the paths that legitimately
     /// run it again -- start, select, mode change -- lift the pause first.
     pub fn save_and_apply(&mut self) -> Result<(), String> {
-        self.save()?;
         if self.core_paused {
-            return Ok(());
+            return self.save();
         }
         let state = self.state.clone();
-        self.sup.apply(&state)
+        // Validation and startup happen before persistence.  A rejected node
+        // therefore cannot become the configuration restored at next boot;
+        // Supervisor::apply leaves the currently running instance untouched
+        // when Xray rejects the staged config.
+        self.sup.apply(&state)?;
+        self.save()
     }
 
     // --- subscriptions ---

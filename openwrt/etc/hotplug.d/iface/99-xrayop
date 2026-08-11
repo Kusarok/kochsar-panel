@@ -39,12 +39,31 @@ PORT=$(uci -q get xrayop.main.listen | sed 's/.*://')
 # Ask the daemon rather than restarting the service: it knows whether the
 # tunnel is even meant to be running, and a restart would drop the panel too.
 if [ -n "$TOKEN" ]; then
-    curl -s --max-time 20 \
-        -H "X-Xrayop-Token: $TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{\"event\":\"$ACTION\"}" \
-        "http://127.0.0.1:$PORT/api/network-changed" >/dev/null 2>&1
-    logger -t xrayop "reacting to $ACTION on $DEVICE (the default route)"
+    # At boot procd can start xrayopd while netifd is already announcing the
+    # WAN.  The daemon restores Xray before it binds the HTTP listener, so a
+    # one-shot curl loses precisely the event that should reconcile the fresh
+    # route.  Retry long enough to cover config validation and Xray startup.
+    attempt=1
+    delivered=0
+    while [ "$attempt" -le 10 ]; do
+        if curl -sS --fail --connect-timeout 2 --max-time 20 \
+            -H "X-Xrayop-Token: $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"event\":\"$ACTION\"}" \
+            "http://127.0.0.1:$PORT/api/network-changed" >/dev/null 2>&1; then
+            delivered=1
+            break
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    if [ "$delivered" -eq 1 ]; then
+        logger -t xrayop "reacted to $ACTION on $DEVICE after $attempt attempt(s)"
+    else
+        logger -t xrayop -p daemon.err \
+            "could not deliver $ACTION on $DEVICE after 10 attempts"
+    fi
 fi
 
 rm -f "$LOCK"

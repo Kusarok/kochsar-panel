@@ -13,7 +13,7 @@
 //!
 //! One throwaway Xray instance is started with a SOCKS inbound per node and a
 //! routing rule pinning each inbound to its own outbound. Every node is then
-//! exercised concurrently with a real HTTPS request through its own port.
+//! exercised one at a time with a real HTTPS request through its own port.
 //! A number that comes back is proof the whole path works: handshake,
 //! encryption, the remote server, and the destination.
 //!
@@ -50,18 +50,15 @@ use std::time::{Duration, Instant};
 
 /// Concurrent probes.
 ///
-/// Lowered from eight. Each probe drives a TLS handshake inside the Xray
-/// instance and another in curl, and on an armv7 router with no crypto
-/// acceleration one handshake costs hundreds of milliseconds of CPU. At eight
-/// they queued, and the queueing landed inside the measurement: the same server
-/// read 1200 ms alone and 2270 ms in a crowded sweep. Ranking on that meant
-/// ranking partly on scheduling luck.
-///
-/// Not lowered further, because [`request_through`] now reports the warm
-/// request, and handshakes happen in the discarded first one. Contention still
-/// exists but has mostly moved outside the timed window, so the remaining
-/// reason to keep this small is politeness to a four-core router.
-const WORKERS: usize = 4;
+/// Each probe drives a TLS handshake inside Xray and another in curl. Even
+/// though the cold request is discarded, concurrent handshakes still compete
+/// with the LAN on a 716 MHz armv7 CPU and distort ranking through scheduler
+/// delay. Serial probes trade sweep duration for stable measurements and leave
+/// capacity for real traffic.
+const WORKERS: usize = 1;
+
+/// Let the router service real traffic between two synthetic measurements.
+const INTER_PROBE_GAP: Duration = Duration::from_millis(300);
 
 /// Upper bound on nodes measured in one sweep.
 ///
@@ -272,6 +269,7 @@ fn run_all(jobs: Vec<(String, u16)>, url: &str, timeout: Duration) -> Vec<(Strin
             if tx.send((id, ms)).is_err() {
                 return;
             }
+            thread::sleep(INTER_PROBE_GAP);
         }));
     }
     drop(tx);
@@ -380,6 +378,12 @@ fn best_attempt(out: &str) -> i32 {
 mod tests {
     use super::*;
     use crate::parse::parse_uri;
+
+    #[test]
+    fn router_sweeps_are_serial_and_yield_between_nodes() {
+        assert_eq!(WORKERS, 1);
+        assert!(INTER_PROBE_GAP >= Duration::from_millis(250));
+    }
 
     fn nodes(n: usize) -> Vec<Node> {
         (0..n)
